@@ -16,7 +16,26 @@
 set(PKG_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ==============================================================================
-# 1. Tasks
+# 1. Eval Pause
+# ==============================================================================
+add_litertlm_library(runtime_core_eval_pause STATIC
+  eval_pause.cc
+)
+add_library(LiteRTLM::Runtime::Core::EvalPause ALIAS runtime_core_eval_pause)
+
+target_include_directories(runtime_core_eval_pause
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_core_eval_pause
+  PUBLIC
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# 2. Tasks
 # ==============================================================================
 add_litertlm_library(runtime_core_tasks STATIC
   tasks.cc
@@ -48,6 +67,7 @@ target_link_libraries(runtime_core_tasks
     runtime_framework_threadpool
     runtime_util_convert_tensor_buffer
     runtime_util_litert_status_util
+    LiteRTLM::Runtime::Core::EvalPause
 
     LITERTLM_DEPS
 )
@@ -85,6 +105,7 @@ target_link_libraries(runtime_core_pipeline
     runtime_executor_llm_litert_compiled_model_executor
     runtime_util_convert_tensor_buffer
     runtime_util_litert_status_util
+    LiteRTLM::Runtime::Core::EvalPause
     LITERTLM_DEPS
 )
 
@@ -274,6 +295,7 @@ add_library(runtime_core_libs INTERFACE)
 add_library(LiteRTLM::Runtime::Core ALIAS runtime_core_libs)
 
 target_link_libraries(runtime_core_libs INTERFACE
+  LiteRTLM::Runtime::Core::EvalPause
   LiteRTLM::Runtime::Core::EngineImpl
   LiteRTLM::Runtime::Core::EngineImplCPU
   LiteRTLM::Runtime::Core::Pipeline

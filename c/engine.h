@@ -385,6 +385,18 @@ LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* settings);
 LITERT_LM_C_API_EXPORT
 void litert_lm_engine_delete(LiteRtLmEngine* engine);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_pause_eval(void);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_resume_eval(void);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_pause_eval(LiteRtLmEngine* engine);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_resume_eval(LiteRtLmEngine* engine);
+
 // Creates a LiteRT LM Session. The caller is responsible for destroying the
 // session using `litert_lm_session_delete`.
 //

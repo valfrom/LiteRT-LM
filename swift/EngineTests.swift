@@ -25,6 +25,11 @@ func testDataPath(forResource resource: String) -> String {
 
 class EngineTests: XCTestCase {
 
+  func testGlobalPauseEvalSymbolsAreCallable() {
+    litertPauseEval()
+    litertResumeEval()
+  }
+
   func testEngineConfig_IsCorrectlySet() async throws {
     let modelResource =
       "runtime/testdata/test_lm_new_metadata.task"

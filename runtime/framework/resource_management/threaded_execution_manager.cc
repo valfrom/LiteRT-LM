@@ -45,6 +45,7 @@
 #include "runtime/components/sampler_factory.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/core/tasks.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
@@ -161,6 +162,7 @@ absl::Status ThreadedExecutionManager::CancelAllTasksInSession(
   for (TaskId task_id : session_lookup_.at(session_id)->active_tasks) {
     task_lookup_.at(task_id).cancelled->store(true);
   }
+  GlobalEvalPauseController().Notify();
   return absl::OkStatus();
 }
 
@@ -770,7 +772,8 @@ absl::Status ThreadedExecutionManager::AddPrefillTask(
     auto responses =
         Tasks::Prefill(*llm_executor.value(), *executor_inputs,
                        /*wait_for_completion=*/true,
-                       /*benchmark_info=*/session_info->benchmark_info);
+                       /*benchmark_info=*/session_info->benchmark_info,
+                       cancelled.get());
     if (!responses.ok()) {
       llm_executor.value().reset();
       FinishTaskAndLogErrors(task_id, responses.status(), std::move(callback));

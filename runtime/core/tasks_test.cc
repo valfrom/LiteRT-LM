@@ -15,7 +15,9 @@
 #include "runtime/core/tasks.h"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>  // NOLINT: Required for path manipulation.
+#include <future>      // NOLINT(build/c++11)
 #include <limits>
 #include <memory>
 #include <optional>
@@ -36,6 +38,7 @@
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
 #include "runtime/components/top_p_cpu_sampler.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
@@ -206,6 +209,99 @@ TEST_F(TasksTest, DecodeSucceed) {
   // not included in the response.
   EXPECT_EQ(task_responses->GetTexts().size(), 1);
   EXPECT_EQ(task_responses->GetTexts()[0], " How's it going?");
+}
+
+TEST_F(TasksTest, PauseResumeRepeated) {
+  auto& controller = GlobalEvalPauseController();
+  controller.Resume();
+  controller.Pause();
+  controller.Pause();
+  std::atomic<bool> cancelled = false;
+  auto future = std::async(std::launch::async, [&] {
+    return controller.WaitIfPaused(&cancelled);
+  });
+  EXPECT_EQ(future.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  controller.Resume();
+  ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  EXPECT_OK(future.get());
+  controller.Pause();
+  controller.Resume();
+  EXPECT_OK(controller.WaitIfPaused());
+}
+
+TEST_F(TasksTest, DecodeBlocksWhilePausedAndResumeContinues) {
+  std::optional<BenchmarkInfo> benchmark_info;
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  auto prefill_responses = Tasks::Prefill(
+      *executor_, inputs, /*wait_for_completion=*/true, benchmark_info);
+  EXPECT_OK(prefill_responses);
+
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  EXPECT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+  std::atomic<bool> cancelled = false;
+
+  GlobalEvalPauseController().Pause();
+  auto future = std::async(std::launch::async, [&] {
+    absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+    return Tasks::Decode(
+        *executor_, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+        benchmark_info, /*sampler=*/std::nullopt,
+        /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+        /*callback=*/callback, &cancelled);
+  });
+  EXPECT_EQ(future.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  GlobalEvalPauseController().Resume();
+  ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  auto responses = future.get();
+  EXPECT_OK(responses);
+  EXPECT_EQ(responses->GetTaskState(), TaskState::kDone);
+}
+
+TEST_F(TasksTest, DecodeCancelWhilePaused) {
+  std::optional<BenchmarkInfo> benchmark_info;
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  auto prefill_responses = Tasks::Prefill(
+      *executor_, inputs, /*wait_for_completion=*/true, benchmark_info);
+  EXPECT_OK(prefill_responses);
+
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  EXPECT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+  std::atomic<bool> cancelled = false;
+
+  GlobalEvalPauseController().Pause();
+  auto future = std::async(std::launch::async, [&] {
+    absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+    return Tasks::Decode(
+        *executor_, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+        benchmark_info, /*sampler=*/std::nullopt,
+        /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+        /*callback=*/callback, &cancelled);
+  });
+  EXPECT_EQ(future.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  cancelled.store(true);
+  GlobalEvalPauseController().Notify();
+  if (future.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+    GlobalEvalPauseController().Resume();
+  }
+  ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  GlobalEvalPauseController().Resume();
+  EXPECT_THAT(future.get(), StatusIs(absl::StatusCode::kCancelled));
 }
 
 TEST_F(TasksTest, DecodeWithTwoStopTokens) {

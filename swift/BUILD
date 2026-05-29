@@ -29,6 +29,7 @@ swift_library(
         "Config.swift",
         "Conversation.swift",
         "Engine.swift",
+        "EvalPause.swift",
         "ExperimentalFlags.swift",
         "LiteRTLMError.swift",
         "Message.swift",
@@ -118,8 +119,13 @@ apple_xcframework(
             "arm64",
         ],
     },
+    macos = [
+        "arm64",
+        "x86_64",
+    ],
     minimum_os_versions = {
         "ios": "15.0",
+        "macos": "12.0",
     },
     public_hdrs = [
         "//c:engine.h",

@@ -275,8 +275,11 @@ rust_register_toolchains(
     extra_target_triples = [
         # Explicitly add toolchains for mobile. Desktop platforms are supported by default.
         "aarch64-linux-android",
+        "aarch64-apple-darwin",
         "aarch64-apple-ios",
         "aarch64-apple-ios-sim",
+        "x86_64-apple-darwin",
+        "x86_64-apple-ios",
         "x86_64-linux-android",
     ],
 )
@@ -536,4 +539,3 @@ filegroup(
     sha256 = "ae13e2effe077e829be759182396b931d8f85cfb9cfe9d49385516ea367ef7b2",
     url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-aarch64.tar.gz",
 )
-

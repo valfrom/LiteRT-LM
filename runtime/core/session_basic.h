@@ -35,6 +35,7 @@
 #include "runtime/components/sampler.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -130,6 +131,7 @@ class SessionBasic : public Engine::Session {
   void CancelProcess() override {
     ABSL_LOG(INFO) << "SessionBasic::CancelProcess";
     cancelled_.store(true);
+    GlobalEvalPauseController().Notify();
   }
 
   absl::Status WaitUntilDone() override {

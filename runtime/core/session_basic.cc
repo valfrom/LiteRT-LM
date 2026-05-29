@@ -288,7 +288,8 @@ absl::Status SessionBasic::PrefillInternal(
                    ProcessAndCombineContents(preprocessed_contents));
   ASSIGN_OR_RETURN(
       last_prefill_token_id_,
-      Prefill(executor_, inputs, wait_for_completion, benchmark_info_));
+      Prefill(executor_, inputs, wait_for_completion, benchmark_info_,
+              &cancelled_));
   session_state_ = SessionState::kPrefilled;
   return absl::OkStatus();
 }
