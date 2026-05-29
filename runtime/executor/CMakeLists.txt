@@ -412,6 +412,7 @@ target_link_libraries(runtime_executor_llm_litert_compiled_model_executor_factor
     runtime_util_litert_status_util
     runtime_util_lora_util
     runtime_util_scoped_file
+    LiteRTLM::Runtime::Core::EvalPause
     LITERTLM_DEPS
 )
 

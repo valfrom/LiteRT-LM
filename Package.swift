@@ -28,25 +28,17 @@ let package = Package(
     )
   ],
   targets: [
-    // The Prebuilt Binary Target for iOS
     .binaryTarget(
       name: "CLiteRTLM",
-      url: "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.13.1/CLiteRTLM.xcframework.zip",
-      checksum: "7ff01c42106b754748b5dd3036a4a57161b25ebf523e705bebc1219061852362"
+      path: "swiftpm/CLiteRTLM.xcframework.zip"
     ),
-    // The Prebuilt Binary Target for Mac
     .binaryTarget(
-      name: "CLiteRTLM_mac",
-      url: "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.13.1/CLiteRTLM_mac.xcframework.zip",
-      checksum: "ec9ffe230dc39117a7fc8933b1cc15910454027fee6d3041534ab7cf17313981"
+      name: "GemmaModelConstraintProvider",
+      path: "swiftpm/GemmaModelConstraintProvider.xcframework.zip"
     ),
-    // The Swift Wrapper Target
     .target(
       name: "LiteRTLM",
-      dependencies: [
-        .target(name: "CLiteRTLM", condition: .when(platforms: [.iOS])),
-        .target(name: "CLiteRTLM_mac", condition: .when(platforms: [.macOS]))
-      ],
+      dependencies: ["CLiteRTLM", "GemmaModelConstraintProvider"],
       path: "swift",
       exclude: [
         "CapabilitiesTests.swift",

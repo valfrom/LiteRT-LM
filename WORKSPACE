@@ -275,8 +275,11 @@ rust_register_toolchains(
     extra_target_triples = [
         # Explicitly add toolchains for mobile. Desktop platforms are supported by default.
         "aarch64-linux-android",
+        "aarch64-apple-darwin",
         "aarch64-apple-ios",
         "aarch64-apple-ios-sim",
+        "x86_64-apple-darwin",
+        "x86_64-apple-ios",
         "x86_64-linux-android",
         "x86_64-apple-darwin",
     ],

@@ -42,9 +42,11 @@ namespace litert::lm {
 
 absl::StatusOr<int> Prefill(LlmExecutor& executor, ExecutorInputs& inputs,
                             bool wait_for_completion,
-                            std::optional<BenchmarkInfo>& benchmark_info) {
+                            std::optional<BenchmarkInfo>& benchmark_info,
+                            std::atomic<bool>* cancelled) {
   auto task_response =
-      Tasks::Prefill(executor, inputs, wait_for_completion, benchmark_info);
+      Tasks::Prefill(executor, inputs, wait_for_completion, benchmark_info,
+                     cancelled);
 
   if (!task_response.ok()) {
     return task_response.status();

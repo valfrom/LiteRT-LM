@@ -39,6 +39,7 @@
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -725,6 +726,24 @@ LiteRtLmEngine* litert_lm_engine_create(
 }
 
 void litert_lm_engine_delete(LiteRtLmEngine* engine) { delete engine; }
+
+void litert_lm_pause_eval() { litert::lm::GlobalEvalPauseController().Pause(); }
+
+void litert_lm_resume_eval() {
+  litert::lm::GlobalEvalPauseController().Resume();
+}
+
+void litert_lm_engine_pause_eval(LiteRtLmEngine* engine) {
+  if (engine && engine->engine) {
+    litert_lm_pause_eval();
+  }
+}
+
+void litert_lm_engine_resume_eval(LiteRtLmEngine* engine) {
+  if (engine && engine->engine) {
+    litert_lm_resume_eval();
+  }
+}
 
 LiteRtLmSession* litert_lm_engine_create_session(
     LiteRtLmEngine* engine, LiteRtLmSessionConfig* config) {

@@ -50,7 +50,8 @@ namespace litert::lm {
 //   the next decode process to determine the token id to start from.
 absl::StatusOr<int> Prefill(LlmExecutor& executor, ExecutorInputs& inputs,
                             bool wait_for_completion,
-                            std::optional<BenchmarkInfo>& benchmark_info);
+                            std::optional<BenchmarkInfo>& benchmark_info,
+                            std::atomic<bool>* cancelled = nullptr);
 
 // Runs the pipeline to decode the input prompt.
 // - executor: The executor that call the core LLM model.
