@@ -21,9 +21,14 @@ bazel --output_base="$BAZEL_OUTPUT_BASE" build --symlink_prefix="$BAZEL_LINK_PRE
 cp "$BAZEL_LINK_PREFIX/bin/swift/CLiteRTLM.xcframework.zip" "$OUT_DIR/CLiteRTLM.xcframework.zip"
 
 for name in GemmaModelConstraintProvider LiteRt LiteRtMetalAccelerator LiteRtTopKMetalSampler; do
-  xcodebuild -create-xcframework \
-    -library "$ROOT/prebuilt/macos_arm64/lib${name}.dylib" \
-    -output "$WORK_DIR/${name}.xcframework"
+  args=()
+  for platform in macos_arm64 ios_arm64 ios_sim_arm64; do
+    library="$ROOT/prebuilt/$platform/lib${name}.dylib"
+    if [ -f "$library" ]; then
+      args+=(-library "$library")
+    fi
+  done
+  xcodebuild -create-xcframework "${args[@]}" -output "$WORK_DIR/${name}.xcframework"
   (cd "$WORK_DIR" && zip -r -X "$OUT_DIR/${name}.xcframework.zip" "${name}.xcframework") >/dev/null
 done
 
