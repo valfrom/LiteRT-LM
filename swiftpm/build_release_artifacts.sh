@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TAG="${1:-eval_pause-macos.1}"
+TAG="${1:-eval_pause}"
 OUT_DIR="${OUT_DIR:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/release-artifacts/$TAG}"
 WORK_DIR="${WORK_DIR:-$OUT_DIR/work}"
 BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/bazel-output-base}"
