@@ -43,6 +43,7 @@ ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/time",
     "@nlohmann_json//:json",
     "//runtime/conversation",
+    "//runtime/components/constrained_decoding:llg_constraint_config",
     "//runtime/conversation:io_types",
     "//runtime/conversation/model_data_processor:config_registry",
     "//runtime/conversation/model_data_processor:gemma4_data_processor_config",

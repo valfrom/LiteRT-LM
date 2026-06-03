@@ -199,6 +199,10 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_enable_constrained_decoding(
     LiteRtLmConversationConfig* config, bool enable_constrained_decoding);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_enable_json_schema_constraints(
+    LiteRtLmConversationConfig* config, bool enable_json_schema_constraints);
+
 // Sets whether to filter channel content from the KV cache.
 // @param config The config to modify.
 // @param filter_channel_content_from_kv_cache Whether to filter channel
@@ -232,6 +236,10 @@ void litert_lm_conversation_optional_args_delete(
 LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_optional_args_set_visual_token_budget(
     LiteRtLmConversationOptionalArgs* optional_args, int visual_token_budget);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_set_json_schema_constraint(
+    LiteRtLmConversationOptionalArgs* optional_args, const char* schema_json);
 
 // Sets the minimum log level for the LiteRT LM library.
 // Log levels are: 0=VERBOSE, 1=DEBUG, 2=INFO, 3=WARNING, 4=ERROR, 5=FATAL,
