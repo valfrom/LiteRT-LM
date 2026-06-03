@@ -45,6 +45,7 @@ ENGINE_COMMON_DEPS = [
     "@nlohmann_json//:json",
     "//runtime/components:tokenizer",
     "//runtime/conversation",
+    "//runtime/components/logits_processor/constrained_decoding:llg_constraint_config",
     "//runtime/conversation:io_types",
     "//runtime/conversation/model_data_processor:config_registry",
     "//runtime/conversation/model_data_processor:gemma4_data_processor_config",

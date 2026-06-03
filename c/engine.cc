@@ -36,6 +36,7 @@
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/tokenizer.h"
 #include "runtime/conversation/conversation.h"
+#include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
@@ -116,7 +117,8 @@ std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
 litert::lm::OptionalArgs CreateOptionalArgs(
     const litert::lm::Conversation* conversation, const char* extra_context,
     std::optional<int> visual_token_budget,
-    std::optional<int> max_output_tokens) {
+    std::optional<int> max_output_tokens,
+    absl::string_view json_schema_constraint) {
   litert::lm::OptionalArgs litert_lm_optional_args;
   if (extra_context) {
     auto extra_context_json =
@@ -131,6 +133,13 @@ litert::lm::OptionalArgs CreateOptionalArgs(
   }
   if (max_output_tokens.has_value()) {
     litert_lm_optional_args.max_output_tokens = max_output_tokens;
+  }
+  if (!json_schema_constraint.empty()) {
+    litert_lm_optional_args.decoding_constraint =
+        litert::lm::LlGuidanceConstraintArg{
+            .constraint_type = litert::lm::LlgConstraintType::kJsonSchema,
+            .constraint_string = std::string(json_schema_constraint),
+        };
   }
   return litert_lm_optional_args;
 }
@@ -270,12 +279,14 @@ struct LiteRtLmConversationConfig {
   std::string messages_json;
   std::string extra_context_json;
   bool enable_constrained_decoding = false;
+  bool enable_json_schema_constraints = false;
   bool filter_channel_content_from_kv_cache = false;
 };
 
 struct LiteRtLmConversationOptionalArgs {
   std::optional<int> visual_token_budget;
   std::optional<int> max_output_tokens;
+  std::string json_schema_constraint;
 };
 
 struct LiteRtLmDetokenizeResult {
@@ -439,6 +450,13 @@ void litert_lm_conversation_config_set_enable_constrained_decoding(
   }
 }
 
+void litert_lm_conversation_config_set_enable_json_schema_constraints(
+    LiteRtLmConversationConfig* config, bool enable_json_schema_constraints) {
+  if (config) {
+    config->enable_json_schema_constraints = enable_json_schema_constraints;
+  }
+}
+
 void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
     LiteRtLmConversationConfig* config,
     bool filter_channel_content_from_kv_cache) {
@@ -468,6 +486,13 @@ void litert_lm_conversation_optional_args_set_max_output_tokens(
     LiteRtLmConversationOptionalArgs* args, int max_output_tokens) {
   if (args) {
     args->max_output_tokens = max_output_tokens;
+  }
+}
+
+void litert_lm_conversation_optional_args_set_json_schema_constraint(
+    LiteRtLmConversationOptionalArgs* args, const char* schema_json) {
+  if (args && schema_json) {
+    args->json_schema_constraint = schema_json;
   }
 }
 
@@ -1157,6 +1182,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
 
     builder.SetPreface(json_preface);
     builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
+    if (c_config->enable_json_schema_constraints) {
+      builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig());
+    }
     builder.SetFilterChannelContentFromKvCache(
         c_config->filter_channel_content_from_kv_cache);
     auto config = builder.Build(*engine->engine);
@@ -1226,7 +1254,9 @@ LiteRtLmJsonResponse* litert_lm_conversation_send_message(
   OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
       conversation->conversation.get(), extra_context,
       optional_args ? optional_args->visual_token_budget : std::nullopt,
-      optional_args ? optional_args->max_output_tokens : std::nullopt);
+      optional_args ? optional_args->max_output_tokens : std::nullopt,
+      optional_args ? absl::string_view(optional_args->json_schema_constraint)
+                    : absl::string_view());
 
   auto response = conversation->conversation->SendMessage(
       json_message, std::move(litert_lm_optional_args));
@@ -1270,7 +1300,9 @@ int litert_lm_conversation_send_message_stream(
   litert::lm::OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
       conversation->conversation.get(), extra_context,
       optional_args ? optional_args->visual_token_budget : std::nullopt,
-      optional_args ? optional_args->max_output_tokens : std::nullopt);
+      optional_args ? optional_args->max_output_tokens : std::nullopt,
+      optional_args ? absl::string_view(optional_args->json_schema_constraint)
+                    : absl::string_view());
 
   absl::Status status = conversation->conversation->SendMessageAsync(
       json_message, CreateConversationCallback(callback, callback_data),
