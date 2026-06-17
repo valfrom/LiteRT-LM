@@ -219,6 +219,10 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_enable_json_schema_constraints(
     LiteRtLmConversationConfig* config, bool enable_json_schema_constraints);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
+
 // Sets whether to filter channel content from the KV cache.
 // @param config The config to modify.
 // @param filter_channel_content_from_kv_cache Whether to filter channel

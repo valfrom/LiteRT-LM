@@ -280,6 +280,7 @@ struct LiteRtLmConversationConfig {
   std::string extra_context_json;
   bool enable_constrained_decoding = false;
   bool enable_json_schema_constraints = false;
+  bool prefill_preface_on_init = false;
   bool filter_channel_content_from_kv_cache = false;
 };
 
@@ -454,6 +455,13 @@ void litert_lm_conversation_config_set_enable_json_schema_constraints(
     LiteRtLmConversationConfig* config, bool enable_json_schema_constraints) {
   if (config) {
     config->enable_json_schema_constraints = enable_json_schema_constraints;
+  }
+}
+
+void litert_lm_conversation_config_set_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {
+  if (config) {
+    config->prefill_preface_on_init = prefill_preface_on_init;
   }
 }
 
@@ -1181,6 +1189,7 @@ LiteRtLmConversation* litert_lm_conversation_create(
     builder.SetSessionConfig(session_config);
 
     builder.SetPreface(json_preface);
+    builder.SetPrefillPrefaceOnInit(c_config->prefill_preface_on_init);
     builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
     if (c_config->enable_json_schema_constraints) {
       builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig());
