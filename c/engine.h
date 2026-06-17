@@ -223,6 +223,14 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_prefill_preface_on_init(
     LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_audio_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_vision_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled);
+
 // Sets whether to filter channel content from the KV cache.
 // @param config The config to modify.
 // @param filter_channel_content_from_kv_cache Whether to filter channel

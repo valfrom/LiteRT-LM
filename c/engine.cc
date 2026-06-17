@@ -281,6 +281,8 @@ struct LiteRtLmConversationConfig {
   bool enable_constrained_decoding = false;
   bool enable_json_schema_constraints = false;
   bool prefill_preface_on_init = false;
+  std::optional<bool> audio_modality_enabled;
+  std::optional<bool> vision_modality_enabled;
   bool filter_channel_content_from_kv_cache = false;
 };
 
@@ -462,6 +464,20 @@ void litert_lm_conversation_config_set_prefill_preface_on_init(
     LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {
   if (config) {
     config->prefill_preface_on_init = prefill_preface_on_init;
+  }
+}
+
+void litert_lm_conversation_config_set_audio_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled) {
+  if (config) {
+    config->audio_modality_enabled = enabled;
+  }
+}
+
+void litert_lm_conversation_config_set_vision_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled) {
+  if (config) {
+    config->vision_modality_enabled = enabled;
   }
 }
 
@@ -1185,6 +1201,14 @@ LiteRtLmConversation* litert_lm_conversation_create(
             .GetVisionExecutorSettings()
             .has_value()) {
       session_config.SetVisionModalityEnabled(true);
+    }
+    if (c_config->audio_modality_enabled.has_value()) {
+      session_config.SetAudioModalityEnabled(
+          c_config->audio_modality_enabled.value());
+    }
+    if (c_config->vision_modality_enabled.has_value()) {
+      session_config.SetVisionModalityEnabled(
+          c_config->vision_modality_enabled.value());
     }
     builder.SetSessionConfig(session_config);
 
