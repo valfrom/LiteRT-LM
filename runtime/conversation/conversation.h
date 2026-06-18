@@ -398,6 +398,39 @@ struct OptionalArgs {
   std::optional<bool> enable_thinking = std::nullopt;
 };
 
+class ConversationSnapshot {
+ private:
+  friend class Conversation;
+
+  ConversationSnapshot(ConversationConfig config, Preface preface,
+                       PromptTemplate prompt_template,
+                       std::unique_ptr<ModelDataProcessor> model_data_processor,
+                       std::unique_ptr<SessionSnapshot> session_snapshot,
+                       std::vector<Message> history, bool is_appending_message,
+                       std::optional<int> checkpoint_message_index,
+                       bool channel_content_since_last_user_message)
+      : config_(std::move(config)),
+        preface_(std::move(preface)),
+        prompt_template_(std::move(prompt_template)),
+        model_data_processor_(std::move(model_data_processor)),
+        session_snapshot_(std::move(session_snapshot)),
+        history_(std::move(history)),
+        is_appending_message_(is_appending_message),
+        checkpoint_message_index_(checkpoint_message_index),
+        channel_content_since_last_user_message_(
+            channel_content_since_last_user_message) {}
+
+  ConversationConfig config_;
+  Preface preface_;
+  PromptTemplate prompt_template_;
+  std::unique_ptr<ModelDataProcessor> model_data_processor_;
+  std::unique_ptr<SessionSnapshot> session_snapshot_;
+  std::vector<Message> history_;
+  bool is_appending_message_;
+  std::optional<int> checkpoint_message_index_;
+  bool channel_content_since_last_user_message_;
+};
+
 // A multi-turn centric stateful Conversation API for high-level user
 // interaction. Conversation maintains the history for users, so the users'
 // messages will be used as the LLM context through the conversation.
@@ -572,6 +605,11 @@ class Conversation {
   // Note that the cloned conversation will not clone the group_id of the
   // ongoing tasks.
   absl::StatusOr<std::unique_ptr<Conversation>> Clone();
+
+  absl::StatusOr<std::unique_ptr<ConversationSnapshot>> CreateSnapshot();
+
+  static absl::StatusOr<std::unique_ptr<Conversation>> CreateFromSnapshot(
+      Engine& engine, const ConversationSnapshot& snapshot);
 
   // Cancels all ongoing asynchronous tasks with the given task_group_id.
   // Args:

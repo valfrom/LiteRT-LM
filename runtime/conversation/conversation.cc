@@ -773,6 +773,68 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Clone() {
   return new_conversation;
 }
 
+absl::StatusOr<std::unique_ptr<ConversationSnapshot>>
+Conversation::CreateSnapshot() {
+  ASSIGN_OR_RETURN(auto session_snapshot, session_->CreateSnapshot());
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<ModelDataProcessor> model_data_processor,
+      CreateModelDataProcessor(config_.GetProcessorConfig(), config_.GetPreface(),
+                               &engine_.GetTokenizer(),
+                               session_->GetSessionConfig().GetStopTokenIds(),
+                               config_.constrained_decoding_enabled(),
+                               config_.GetPromptTemplate().GetCapabilities()));
+  auto status = model_data_processor->CloneState(*model_data_processor_);
+  if (!status.ok() && !absl::IsUnimplemented(status)) {
+    return status;
+  }
+  std::vector<Message> history;
+  {
+    absl::MutexLock lock(history_mutex_);  // NOLINT
+    history = history_;
+  }
+  return absl::WrapUnique(new ConversationSnapshot(
+      config_, preface_, prompt_template_, std::move(model_data_processor),
+      std::move(session_snapshot), std::move(history), is_appending_message_,
+      checkpoint_message_index_, channel_content_since_last_user_message_));
+}
+
+absl::StatusOr<std::unique_ptr<Conversation>>
+Conversation::CreateFromSnapshot(Engine& engine,
+                                 const ConversationSnapshot& snapshot) {
+  ASSIGN_OR_RETURN(auto session,
+                   engine.CreateSessionFromSnapshot(*snapshot.session_snapshot_));
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<ModelDataProcessor> model_data_processor,
+      CreateModelDataProcessor(
+          snapshot.config_.GetProcessorConfig(), snapshot.config_.GetPreface(),
+          &engine.GetTokenizer(), session->GetSessionConfig().GetStopTokenIds(),
+          snapshot.config_.constrained_decoding_enabled(),
+          snapshot.config_.GetPromptTemplate().GetCapabilities()));
+  auto status =
+      model_data_processor->CloneState(*snapshot.model_data_processor_);
+  if (!status.ok() && !absl::IsUnimplemented(status)) {
+    return status;
+  }
+  std::unique_ptr<ConstraintProvider> constraint_provider;
+  if (snapshot.config_.constraint_provider_config().has_value()) {
+    ASSIGN_OR_RETURN(
+        constraint_provider,
+        CreateConstraintProvider(
+            snapshot.config_.constraint_provider_config().value(),
+            engine.GetTokenizer(), session->GetSessionConfig().GetStopTokenIds()));
+  }
+  auto conversation = absl::WrapUnique(new Conversation(
+      engine, std::move(session), std::move(model_data_processor),
+      snapshot.preface_, snapshot.prompt_template_, snapshot.config_,
+      std::move(constraint_provider)));
+  conversation->is_appending_message_ = snapshot.is_appending_message_;
+  conversation->history_ = snapshot.history_;
+  conversation->checkpoint_message_index_ = snapshot.checkpoint_message_index_;
+  conversation->channel_content_since_last_user_message_ =
+      snapshot.channel_content_since_last_user_message_;
+  return conversation;
+}
+
 absl::StatusOr<std::string> Conversation::RenderMessageIntoString(
     const Message& message, OptionalArgs optional_args) {
   return GetSingleTurnText(message, optional_args);

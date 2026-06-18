@@ -70,6 +70,30 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
       /*last_task_ids=*/{}, living_sessions_count));
 }
 
+absl::StatusOr<std::unique_ptr<SessionAdvanced>>
+SessionAdvanced::CreateFromSnapshot(
+    std::weak_ptr<ExecutionManager> execution_manager,
+    Tokenizer* absl_nonnull tokenizer, const SessionAdvancedSnapshot& snapshot,
+    std::atomic<int>* living_sessions_count) {
+  auto execution_manager_lock = execution_manager.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ASSIGN_OR_RETURN(auto context_handler,
+                   execution_manager_lock->CloneContext(snapshot.context_handler_));
+  ASSIGN_OR_RETURN(auto session_id,
+                   execution_manager_lock->RegisterSessionFromContext(
+                       snapshot.session_config_, snapshot.benchmark_info_,
+                       std::move(context_handler),
+                       snapshot.last_prefill_token_id_));
+  ASSIGN_OR_RETURN(auto session_info,
+                   execution_manager_lock->GetSessionInfo(session_id));
+  return absl::WrapUnique(new SessionAdvanced(
+      session_id, execution_manager, tokenizer, session_info,
+      static_cast<SessionState>(snapshot.session_state_),
+      /*last_task_ids=*/{}, living_sessions_count));
+}
+
 absl::Status SessionAdvanced::RunPrefill(
     const std::vector<InputData>& contents) {
   absl::Status status = absl::OkStatus();
@@ -456,6 +480,22 @@ SessionAdvanced::CloneAsyncLocked(
   return absl::WrapUnique(new SessionAdvanced(session_id, execution_manager_,
                                               tokenizer_, session_info,
                                               session_state_, last_task_ids_));
+}
+
+absl::StatusOr<std::unique_ptr<SessionSnapshot>>
+SessionAdvanced::CreateSnapshot() {
+  RETURN_IF_ERROR(WaitUntilDone());
+  absl::MutexLock lock(mutex_);
+  auto execution_manager_lock = execution_manager_.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ASSIGN_OR_RETURN(auto context_handler,
+                   execution_manager_lock->CloneSessionContext(session_id_));
+  return std::make_unique<SessionAdvancedSnapshot>(
+      session_info_->session_config, session_info_->benchmark_info,
+      std::move(context_handler), session_info_->last_prefill_token_id,
+      static_cast<int>(session_state_));
 }
 
 SessionAdvanced::~SessionAdvanced() {

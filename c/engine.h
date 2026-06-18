@@ -55,6 +55,8 @@ typedef struct LiteRtLmBenchmarkInfo LiteRtLmBenchmarkInfo;
 // Opaque pointer for the LiteRT LM Conversation.
 typedef struct LiteRtLmConversation LiteRtLmConversation;
 
+typedef struct LiteRtLmConversationSnapshot LiteRtLmConversationSnapshot;
+
 // Opaque pointer for the LiteRT LM Conversation Optional Args.
 typedef struct LiteRtLmConversationOptionalArgs
     LiteRtLmConversationOptionalArgs;
@@ -835,6 +837,18 @@ void litert_lm_conversation_delete(LiteRtLmConversation* conversation);
 LITERT_LM_C_API_EXPORT
 LiteRtLmConversation* litert_lm_conversation_clone(
     LiteRtLmConversation* conversation);
+
+LITERT_LM_C_API_EXPORT
+LiteRtLmConversationSnapshot* litert_lm_conversation_snapshot_create(
+    LiteRtLmConversation* conversation);
+
+LITERT_LM_C_API_EXPORT
+LiteRtLmConversation* litert_lm_conversation_create_from_snapshot(
+    LiteRtLmEngine* engine, LiteRtLmConversationSnapshot* snapshot);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_snapshot_delete(
+    LiteRtLmConversationSnapshot* snapshot);
 
 // Sends a message to the conversation and returns the response.
 // This is a blocking call.

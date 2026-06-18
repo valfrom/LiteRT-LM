@@ -99,6 +99,11 @@ class SerialExecutionManager : public ExecutionManager {
       SessionConfig session_config,
       std::optional<BenchmarkInfo> benchmark_info) override;
 
+  absl::StatusOr<SessionId> RegisterSessionFromContext(
+      SessionConfig session_config, std::optional<BenchmarkInfo> benchmark_info,
+      std::shared_ptr<ContextHandler> context_handler,
+      int last_prefill_token_id) override;
+
   // Releases the session with the given session ID.
   absl::Status ReleaseSession(SessionId session_id) override;
 
@@ -111,6 +116,12 @@ class SerialExecutionManager : public ExecutionManager {
   // - INVALID_ARGUMENT if the session ID is not found.
   absl::StatusOr<std::shared_ptr<const SessionInfo>> GetSessionInfo(
       SessionId session_id) override;
+
+  absl::StatusOr<std::unique_ptr<ContextHandler>> CloneSessionContext(
+      SessionId session_id) override;
+
+  absl::StatusOr<std::unique_ptr<ContextHandler>> CloneContext(
+      std::shared_ptr<const ContextHandler> context_handler) override;
 
   // Returns the mutable benchmark info with the given session ID.
   // Note: The returned benchmark info is not thread-safe and should be used

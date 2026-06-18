@@ -124,6 +124,24 @@ class EngineAdvancedImpl : public Engine {
     }
     return session;
   }
+
+  absl::StatusOr<std::unique_ptr<Session>> CreateSessionFromSnapshot(
+      const SessionSnapshot& snapshot) override {
+    const auto* advanced_snapshot =
+        dynamic_cast<const SessionAdvancedSnapshot*>(&snapshot);
+    if (advanced_snapshot == nullptr) {
+      return absl::InvalidArgumentError("Snapshot type mismatch.");
+    }
+    if (litert_model_resources_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "Model resources are not initialized.");
+    }
+    ASSIGN_OR_RETURN(auto session, SessionAdvanced::CreateFromSnapshot(
+                                       execution_manager_, tokenizer_.get(),
+                                       *advanced_snapshot, &living_sessions_));
+    return session;
+  }
+
   absl::Status WaitUntilDone(absl::Duration timeout) override {
     return execution_manager_->WaitUntilAllDone(timeout);
   }

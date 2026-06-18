@@ -262,6 +262,10 @@ struct LiteRtLmConversation {
   std::string last_rendered_message;
 };
 
+struct LiteRtLmConversationSnapshot {
+  std::unique_ptr<litert::lm::ConversationSnapshot> snapshot;
+};
+
 struct LiteRtLmJsonResponse {
   std::string json_string;
 };
@@ -1267,6 +1271,44 @@ LiteRtLmConversation* litert_lm_conversation_clone(
   auto c_conversation = std::make_unique<LiteRtLmConversation>();
   c_conversation->conversation = std::move(*cloned);
   return c_conversation.release();
+}
+
+LiteRtLmConversationSnapshot* litert_lm_conversation_snapshot_create(
+    LiteRtLmConversation* conversation) {
+  if (!conversation || !conversation->conversation) {
+    return nullptr;
+  }
+  auto snapshot = conversation->conversation->CreateSnapshot();
+  if (!snapshot.ok()) {
+    ABSL_LOG(ERROR) << "Failed to create conversation snapshot: "
+                    << snapshot.status();
+    return nullptr;
+  }
+  auto c_snapshot = std::make_unique<LiteRtLmConversationSnapshot>();
+  c_snapshot->snapshot = std::move(*snapshot);
+  return c_snapshot.release();
+}
+
+LiteRtLmConversation* litert_lm_conversation_create_from_snapshot(
+    LiteRtLmEngine* engine, LiteRtLmConversationSnapshot* snapshot) {
+  if (!engine || !engine->engine || !snapshot || !snapshot->snapshot) {
+    return nullptr;
+  }
+  auto conversation =
+      Conversation::CreateFromSnapshot(*engine->engine, *snapshot->snapshot);
+  if (!conversation.ok()) {
+    ABSL_LOG(ERROR) << "Failed to create conversation from snapshot: "
+                    << conversation.status();
+    return nullptr;
+  }
+  auto c_conversation = std::make_unique<LiteRtLmConversation>();
+  c_conversation->conversation = std::move(*conversation);
+  return c_conversation.release();
+}
+
+void litert_lm_conversation_snapshot_delete(
+    LiteRtLmConversationSnapshot* snapshot) {
+  delete snapshot;
 }
 
 LiteRtLmJsonResponse* litert_lm_conversation_send_message(

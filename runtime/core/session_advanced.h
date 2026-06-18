@@ -42,6 +42,28 @@
 
 namespace litert::lm {
 
+class SessionAdvancedSnapshot : public SessionSnapshot {
+ public:
+  SessionAdvancedSnapshot(SessionConfig session_config,
+                          std::optional<BenchmarkInfo> benchmark_info,
+                          std::shared_ptr<ContextHandler> context_handler,
+                          int last_prefill_token_id, int session_state)
+      : session_config_(std::move(session_config)),
+        benchmark_info_(std::move(benchmark_info)),
+        context_handler_(std::move(context_handler)),
+        last_prefill_token_id_(last_prefill_token_id),
+        session_state_(session_state) {}
+
+ private:
+  friend class SessionAdvanced;
+
+  SessionConfig session_config_;
+  std::optional<BenchmarkInfo> benchmark_info_;
+  std::shared_ptr<ContextHandler> context_handler_;
+  int last_prefill_token_id_;
+  int session_state_;
+};
+
 // SessionAdvanced is an implementation of SessionInterface. The
 // underlying prefill/decode use the LLM Execution Manager's advanced resource
 // management to support efficient multi-sessions and session cloning features.
@@ -87,6 +109,11 @@ class SessionAdvanced : public SessionInterface {
       std::weak_ptr<ExecutionManager> execution_manager,
       Tokenizer* absl_nonnull tokenizer, const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
+      std::atomic<int>* living_sessions_count = nullptr);
+
+  static absl::StatusOr<std::unique_ptr<SessionAdvanced>> CreateFromSnapshot(
+      std::weak_ptr<ExecutionManager> execution_manager,
+      Tokenizer* absl_nonnull tokenizer, const SessionAdvancedSnapshot& snapshot,
       std::atomic<int>* living_sessions_count = nullptr);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
@@ -206,6 +233,9 @@ class SessionAdvanced : public SessionInterface {
   // TODO b/409401231 - Add unit tests for this function.
   absl::StatusOr<std::unique_ptr<SessionInterface>> CloneAsync(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::StatusOr<std::unique_ptr<SessionSnapshot>> CreateSnapshot() override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
  private:

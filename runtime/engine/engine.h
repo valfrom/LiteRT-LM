@@ -67,6 +67,11 @@ namespace litert::lm {
 // by the Engine and is responsible for:
 // - Generating content from the input prompt/query.
 // - Running the prefill and decode processes.
+class SessionSnapshot {
+ public:
+  virtual ~SessionSnapshot() = default;
+};
+
 class SessionInterface {
  public:
   // The TaskController is responsible for controlling the async task
@@ -277,6 +282,9 @@ class SessionInterface {
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
     return absl::UnimplementedError("Not implemented.");
   };
+  virtual absl::StatusOr<std::unique_ptr<SessionSnapshot>> CreateSnapshot() {
+    return absl::UnimplementedError("Not implemented.");
+  }
   // Save the current step with the name `label`. You can later rewind to this
   // checkpoint using `RewindToCheckpoint(label)`. If the checkpoint name
   // already exists, the step number will be overwritten.
@@ -326,6 +334,11 @@ class EngineT {
   // Method to create the Session.
   virtual absl::StatusOr<std::unique_ptr<SessionT>> CreateSession(
       const SessionConfig& session_config) = 0;
+
+  virtual absl::StatusOr<std::unique_ptr<SessionT>> CreateSessionFromSnapshot(
+      const SessionSnapshot& snapshot) {
+    return absl::UnimplementedError("Not implemented.");
+  }
 
   // Waits until the engine is done with all the tasks. The function will
   // return error if the timeout is reached.

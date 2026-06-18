@@ -171,6 +171,15 @@ absl::StatusOr<SessionId> SerialExecutionManager::RegisterNewSession(
     SessionConfig session_config, std::optional<BenchmarkInfo> benchmark_info) {
   ASSIGN_OR_RETURN(auto context_handler,
                    resource_manager_->CreateContextHandler(session_config));
+  return RegisterSessionFromContext(std::move(session_config),
+                                    std::move(benchmark_info),
+                                    std::move(context_handler),
+                                    /*last_prefill_token_id=*/0);
+}
+
+absl::StatusOr<SessionId> SerialExecutionManager::RegisterSessionFromContext(
+    SessionConfig session_config, std::optional<BenchmarkInfo> benchmark_info,
+    std::shared_ptr<ContextHandler> context_handler, int last_prefill_token_id) {
   std::unique_ptr<Sampler> sampler;
   if (session_config.UseExternalSampler()) {
     if (session_config.GetSamplerBackend() != Backend::CPU) {
@@ -196,6 +205,7 @@ absl::StatusOr<SessionId> SerialExecutionManager::RegisterNewSession(
       .session_config = std::move(session_config),
       .context_handler = std::move(context_handler),
       .sampler = std::move(sampler),
+      .last_prefill_token_id = last_prefill_token_id,
       .stop_token_detector = std::move(stop_token_detector),
       .benchmark_info = std::move(benchmark_info),
   });
@@ -250,6 +260,22 @@ SerialExecutionManager::GetSessionInfo(SessionId session_id) {
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
   return session_lookup_.at(session_id);
+}
+
+absl::StatusOr<std::unique_ptr<ContextHandler>>
+SerialExecutionManager::CloneSessionContext(SessionId session_id) {
+  if (!session_lookup_.contains(session_id)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Session ", session_id, " not found in session list."));
+  }
+  return resource_manager_->CloneContextHandler(
+      session_lookup_.at(session_id)->context_handler);
+}
+
+absl::StatusOr<std::unique_ptr<ContextHandler>>
+SerialExecutionManager::CloneContext(
+    std::shared_ptr<const ContextHandler> context_handler) {
+  return resource_manager_->CloneContextHandler(std::move(context_handler));
 }
 
 absl::StatusOr<BenchmarkInfo*> SerialExecutionManager::GetMutableBenchmarkInfo(

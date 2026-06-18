@@ -112,6 +112,11 @@ class ExecutionManager {
       SessionConfig session_config,
       std::optional<BenchmarkInfo> benchmark_info) = 0;
 
+  virtual absl::StatusOr<SessionId> RegisterSessionFromContext(
+      SessionConfig session_config, std::optional<BenchmarkInfo> benchmark_info,
+      std::shared_ptr<ContextHandler> context_handler,
+      int last_prefill_token_id) = 0;
+
   absl::StatusOr<SessionId> RegisterNewSession(SessionConfig session_config) {
     return RegisterNewSession(std::move(session_config), std::nullopt);
   }
@@ -128,6 +133,12 @@ class ExecutionManager {
   // - INVALID_ARGUMENT if the session ID is not found.
   virtual absl::StatusOr<std::shared_ptr<const SessionInfo>> GetSessionInfo(
       SessionId session_id) = 0;
+
+  virtual absl::StatusOr<std::unique_ptr<ContextHandler>> CloneSessionContext(
+      SessionId session_id) = 0;
+
+  virtual absl::StatusOr<std::unique_ptr<ContextHandler>> CloneContext(
+      std::shared_ptr<const ContextHandler> context_handler) = 0;
 
   // Returns the mutable benchmark info with the given session ID.
   // Note: The returned benchmark info is not thread-safe and should be used
