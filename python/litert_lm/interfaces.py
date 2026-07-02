@@ -25,6 +25,7 @@ import os
 import sys
 from typing import Any
 
+from ._ffi import ActivationDataType
 from ._messages import Contents
 from ._messages import Message
 
@@ -242,6 +243,8 @@ class AbstractEngine(abc.ABC):
       backend: The hardware backend used for inference.
       max_num_tokens: Maximum number of tokens for the KV cache. If None, use
         the engine/model's default.
+      max_num_images: Maximum number of images that can be processed in a single
+        inference call.
       cache_dir: Directory for caching compiled model artifacts.
       vision_backend: The hardware backend used for vision encoding.
       audio_backend: The hardware backend used for audio encoding.
@@ -257,11 +260,13 @@ class AbstractEngine(abc.ABC):
   model_path: str
   backend: Backend
   max_num_tokens: int | None = None
+  max_num_images: int | None = None
   cache_dir: str = ""
   vision_backend: Backend | None = None
   audio_backend: Backend | None = None
   enable_speculative_decoding: bool | None = None
   lora_rank_config: LoraRankConfig | None = None
+  activation_data_type: ActivationDataType | None = None
 
   def __enter__(self) -> AbstractEngine:
     """Initializes the engine resources."""
@@ -289,6 +294,7 @@ class AbstractEngine(abc.ABC):
       filter_channel_content_from_kv_cache: bool = False,
       sampler_config: SamplerConfig | None = None,
       lora_config: LoraConfig | None = None,
+      max_output_tokens: int | None = None,
   ) -> AbstractConversation:
     """Creates a new conversation for this engine.
 
@@ -307,6 +313,7 @@ class AbstractEngine(abc.ABC):
         sampler_config: Configuration for the sampling process. If None, then
           uses the engine's default values.
         lora_config: Configuration for LoRA adapters.
+        max_output_tokens: The maximum number of output tokens.
     """
 
   @abc.abstractmethod
@@ -360,6 +367,7 @@ class AbstractConversation(abc.ABC):
       extra_context: Extra context for the chat template.
       sampler_config: Configuration for the sampling process.
       lora_config: Configuration for LoRA adapters.
+      max_output_tokens: The maximum number of output tokens.
   """
 
   def __init__(
@@ -378,6 +386,7 @@ class AbstractConversation(abc.ABC):
       extra_context: collections.abc.Mapping[str, Any] | None = None,
       sampler_config: SamplerConfig | None = None,
       lora_config: LoraConfig | None = None,
+      max_output_tokens: int | None = None,
   ):
     """Initializes the instance.
 
@@ -392,6 +401,7 @@ class AbstractConversation(abc.ABC):
         sampler_config: Configuration for the sampling process. If None, then
           uses the engine's default values.
         lora_config: Configuration for LoRA adapters.
+        max_output_tokens: The maximum number of output tokens.
     """
     self.messages = messages or []
     self.tools = tools or []
@@ -400,6 +410,7 @@ class AbstractConversation(abc.ABC):
     self.extra_context = extra_context or {}
     self.sampler_config = sampler_config
     self.lora_config = lora_config
+    self.max_output_tokens = max_output_tokens
 
   def __enter__(self) -> AbstractConversation:
     """Initializes the conversation."""
@@ -525,6 +536,10 @@ class AbstractBenchmark(abc.ABC):
         it.
       bos_token_id: The BOS token id for the model if one is configured.
       eos_token_ids: Stop token sequences configured for the model.
+      prompt: The custom prompt string to tokenize and run. If the tokenized
+        prompt is shorter than `prefill_tokens`, the remaining tokens are
+        padded with zero. If it is longer, the prompt is truncated to
+        `prefill_tokens`.
   """
 
   model_path: str
@@ -534,6 +549,8 @@ class AbstractBenchmark(abc.ABC):
   max_num_tokens: int | None = None
   cache_dir: str = ""
   enable_speculative_decoding: bool | None = None
+  prompt: str = "How are you"
+  activation_data_type: ActivationDataType | None = None
 
   @abc.abstractmethod
   def run(self) -> BenchmarkInfo:

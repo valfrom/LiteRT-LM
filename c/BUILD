@@ -43,7 +43,7 @@ ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/strings:string_view",
     "@com_google_absl//absl/time",
     "@nlohmann_json//:json",
-    "//runtime/components:tokenizer",
+    "@litert//support/tokenizer",
     "//runtime/conversation",
     "//runtime/components/logits_processor/constrained_decoding:llg_constraint_config",
     "//runtime/conversation:io_types",
@@ -150,5 +150,7 @@ cc_binary(
     linkshared = 1,
     deps = ENGINE_COMMON_DEPS + [
         "//runtime/core:engine_impl",
-    ],
+    ] + select({
+        "//conditions:default": [],
+    }),
 )

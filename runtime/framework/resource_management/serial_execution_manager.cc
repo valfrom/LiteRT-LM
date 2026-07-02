@@ -21,8 +21,10 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
@@ -39,17 +41,19 @@
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/logits_processor/constrained_decoding/constraint.h"
+#include "runtime/components/logits_processor/repetition_penalty_config.h"
+#include "runtime/components/logits_processor/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler.h"
 #include "runtime/components/sampler_factory.h"
 #include "runtime/components/stop_token_detector.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/core/eval_pause.h"
 #include "runtime/core/tasks.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/audio_executor.h"
 #include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/vision_executor_settings.h"
@@ -226,6 +230,12 @@ absl::Status SerialExecutionManager::ReleaseSession(SessionId session_id) {
                      resource_manager_->AcquireAudioExecutor());
     audio_executor->Reset().IgnoreError();
   }
+  std::erase_if(ready_queue_, [this, session_id](TaskId tid) {
+    return task_lookup_.at(tid).session_id == session_id;
+  });
+  absl::erase_if(task_lookup_, [session_id](const auto& kv) {
+    return kv.second.session_id == session_id;
+  });
   session_lookup_.erase(session_id);
   return absl::OkStatus();
 }
@@ -291,8 +301,8 @@ absl::Status SerialExecutionManager::CreateTask(
 
     auto task_it = task_lookup_.find(dep_task_id);
     if (task_it == task_lookup_.end()) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "Dependency task ", dep_task_id, " not found in task list."));
+      return absl::InvalidArgumentError(
+          absl::StrCat("Dependency task ", dep_task_id, " is invalid."));
     }
     TaskInfo& dep_task_info = task_it->second;
 
@@ -741,6 +751,8 @@ absl::Status SerialExecutionManager::AddPrefillTask(
 
 absl::Status SerialExecutionManager::AddDecodeTask(
     SessionId session_id, TaskId task_id, absl::flat_hash_set<TaskId> dep_tasks,
+    RepetitionPenaltyConfig repetition_penalty_config,
+    SuppressTokensConfig suppress_tokens_config,
     Constraint* absl_nullable constraint,
     std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -749,7 +761,10 @@ absl::Status SerialExecutionManager::AddDecodeTask(
     callback = [](absl::StatusOr<Responses>) {};
   }
 
-  auto task = [this, task_id, constraint, max_output_tokens]() mutable {
+  auto task = [this, task_id,
+               repetition_penalty_config = std::move(repetition_penalty_config),
+               suppress_tokens_config = std::move(suppress_tokens_config),
+               constraint, max_output_tokens]() mutable {
     auto task_info_or = StartTask(task_id);
     if (!task_info_or.ok()) {
       FinishTaskAndLogErrors(task_id, task_info_or.status(),
@@ -793,6 +808,7 @@ absl::Status SerialExecutionManager::AddDecodeTask(
     auto responses = Tasks::Decode(
         *llm_executor.value(), *tokenizer_, *session_info->stop_token_detector,
         num_output_candidates, session_info->benchmark_info, optional_sampler,
+        std::move(repetition_penalty_config), std::move(suppress_tokens_config),
         constraint, std::move(decoded_ids_buffer), callback, cancelled.get(),
         max_output_tokens);
 
@@ -901,8 +917,8 @@ absl::Status SerialExecutionManager::AddCloneSessionTask(
     FinishTaskAndLogErrors(task_id, result, std::move(callback));
   };
 
-  return CreateTask(session_id, task_id, std::move(task), std::move(dep_tasks),
-                    cancelled, std::move(callback));
+  return CreateTask(cloned_session_id, task_id, std::move(task),
+                    std::move(dep_tasks), cancelled, std::move(callback));
 }
 
 absl::Status SerialExecutionManager::AddTextScoringTask(

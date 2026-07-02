@@ -29,6 +29,9 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
+#include "runtime/components/logits_processor/repetition_penalty_config.h"
+#include "runtime/components/logits_processor/suppress_tokens_config.h"
 #include "runtime/components/sampler.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/engine/engine_settings.h"
@@ -161,12 +164,17 @@ class ExecutionManager {
   // - task_id: The task ID of the task.
   // - dep_tasks: The dependent tasks that should be done before the decode
   //   task starts.
+  // - repetition_penalty_config: The repetition penalty config for the decode
+  //   task.
+  // - suppress_tokens_config: The suppress tokens config for the decode task.
   // - constraint: The constraint for the decode task.
   // - cancelled: The cancelled flag for the decode task.
   // - callback: The callback function.
   virtual absl::Status AddDecodeTask(
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
+      RepetitionPenaltyConfig repetition_penalty_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -177,10 +185,14 @@ class ExecutionManager {
   absl::Status AddDecodeTask(
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
+      RepetitionPenaltyConfig repetition_penalty_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
-    return AddDecodeTask(session_id, task_id, std::move(dep_tasks), constraint,
+    return AddDecodeTask(session_id, task_id, std::move(dep_tasks),
+                         std::move(repetition_penalty_config),
+                         std::move(suppress_tokens_config), constraint,
                          std::move(cancelled), std::move(callback),
                          std::numeric_limits<int>::max());
   }

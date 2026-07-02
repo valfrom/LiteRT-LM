@@ -34,7 +34,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
@@ -53,7 +53,8 @@ using TaskController = SessionInterface::TaskController;
 // static
 absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
     std::weak_ptr<ExecutionManager> execution_manager,
-    Tokenizer* absl_nonnull tokenizer, const SessionConfig& session_config,
+    support::Tokenizer* absl_nonnull tokenizer,
+    const SessionConfig& session_config,
     std::optional<BenchmarkInfo> benchmark_info,
     std::atomic<int>* living_sessions_count) {
   auto execution_manager_lock = execution_manager.lock();
@@ -286,7 +287,9 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
   ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
 
   RETURN_IF_ERROR(execution_manager_lock->AddDecodeTask(
-      session_id_, task_id, last_task_ids_, decode_config.GetConstraint(),
+      session_id_, task_id, last_task_ids_,
+      decode_config.GetRepetitionPenaltyConfig(),
+      decode_config.GetSuppressTokensConfig(), decode_config.GetConstraint(),
       cancelled, std::move(callback),
       decode_config.GetMaxOutputTokens().value_or(
           session_info_->session_config.GetMaxOutputTokens())));
@@ -419,7 +422,7 @@ absl::StatusOr<std::unique_ptr<SessionInterface>> SessionAdvanced::Clone() {
           status = responses.status();
         }));
   }
-  RETURN_IF_ERROR(WaitUntilDone());
+  RETURN_IF_ERROR(session->WaitUntilDone());
   RETURN_IF_ERROR(status);
   return session;
 }
@@ -482,7 +485,7 @@ absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
   }
   ASSIGN_OR_RETURN(int current_step,
                    execution_manager_lock->GetCurrentStep(*session_info_));
-  checkpoint_map_[label] = {current_step, session_state_};
+  checkpoint_map_[label] = {current_step, session_state_, last_task_ids_};
   return absl::OkStatus();
 }
 
@@ -496,6 +499,11 @@ absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
   }
   int target_step = it->second.step;
   session_state_ = it->second.state;
+  // Restore the task dependencies. This is necessary to prevent task-dependency
+  // errors when a task is failed before the rewind. Otherwise, if the task
+  // failed, because of the dependency chain, all tasks after the rewind point
+  // would be considered as failed then finished immediately.
+  last_task_ids_ = it->second.last_task_ids;
 
   // Remove all checkpoints after the current step.
   absl::erase_if(checkpoint_map_, [target_step](const auto& pair) {
@@ -521,6 +529,12 @@ absl::Status SessionAdvanced::RewindToStep(int step) {
   } else {
     session_state_ = SessionState::kFresh;
   }
+
+  // Break dependency chain on raw step rewind. This is necessary to prevent
+  // task-dependency errors when a task is failed before the rewind. Otherwise,
+  // if the task failed, because of the dependency chain, all tasks after the
+  // rewind point would be considered as failed then finished immediately.
+  last_task_ids_.clear();
 
   // Remove all checkpoints after the current step.
   absl::erase_if(checkpoint_map_,

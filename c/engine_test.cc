@@ -86,6 +86,8 @@ using SessionPtr =
     std::unique_ptr<LiteRtLmSession, decltype(&litert_lm_session_delete)>;
 using ResponsesPtr =
     std::unique_ptr<LiteRtLmResponses, decltype(&litert_lm_responses_delete)>;
+using InputDataPtr =
+    std::unique_ptr<LiteRtLmInputData, decltype(&litert_lm_input_data_delete)>;
 using ConversationPtr =
     std::unique_ptr<LiteRtLmConversation,
                     decltype(&litert_lm_conversation_delete)>;
@@ -95,6 +97,9 @@ using JsonResponsePtr =
 using SessionConfigPtr =
     std::unique_ptr<LiteRtLmSessionConfig,
                     decltype(&litert_lm_session_config_delete)>;
+using SamplerParamsPtr =
+    std::unique_ptr<LiteRtLmSamplerParams,
+                    decltype(&litert_lm_sampler_params_delete)>;
 using ConversationConfigPtr =
     std::unique_ptr<LiteRtLmConversationConfig,
                     decltype(&litert_lm_conversation_config_delete)>;
@@ -306,17 +311,20 @@ TEST(EngineCTest, CreateSettingsFromRawFileDescriptor) {
 }
 
 TEST(EngineCTest, CreateSessionConfigWithSamplerParams) {
-  LiteRtLmSamplerParams sampler_params;
-  sampler_params.type = kLiteRtLmSamplerTypeTopP;
-  sampler_params.top_k = 10;
-  sampler_params.top_p = 0.5f;
-  sampler_params.temperature = 0.1f;
-  sampler_params.seed = 1234;
+  SamplerParamsPtr sampler_params(
+      litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP),
+      &litert_lm_sampler_params_delete);
+  ASSERT_NE(sampler_params, nullptr);
+  litert_lm_sampler_params_set_top_k(sampler_params.get(), 10);
+  litert_lm_sampler_params_set_top_p(sampler_params.get(), 0.5f);
+  litert_lm_sampler_params_set_temperature(sampler_params.get(), 0.1f);
+  litert_lm_sampler_params_set_seed(sampler_params.get(), 1234);
 
   SessionConfigPtr config(litert_lm_session_config_create(),
                           &litert_lm_session_config_delete);
   ASSERT_NE(config, nullptr);
-  litert_lm_session_config_set_sampler_params(config.get(), &sampler_params);
+  litert_lm_session_config_set_sampler_params(config.get(),
+                                              sampler_params.get());
 
   const auto& params = config->config->GetSamplerParams();
   EXPECT_EQ(params.k(), 10);
@@ -369,17 +377,19 @@ TEST(EngineCTest, CreateConversationConfig) {
   ASSERT_NE(engine, nullptr);
 
   // 2. Create Sampler Params.
-  LiteRtLmSamplerParams sampler_params;
-  sampler_params.type = kLiteRtLmSamplerTypeTopP;
-  sampler_params.top_k = 10;
-  sampler_params.top_p = 0.5f;
-  sampler_params.temperature = 0.1f;
-  sampler_params.seed = 1234;
+  SamplerParamsPtr sampler_params(
+      litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP),
+      &litert_lm_sampler_params_delete);
+  ASSERT_NE(sampler_params, nullptr);
+  litert_lm_sampler_params_set_top_k(sampler_params.get(), 10);
+  litert_lm_sampler_params_set_top_p(sampler_params.get(), 0.5f);
+  litert_lm_sampler_params_set_temperature(sampler_params.get(), 0.1f);
+  litert_lm_sampler_params_set_seed(sampler_params.get(), 1234);
   SessionConfigPtr session_config(litert_lm_session_config_create(),
                                   &litert_lm_session_config_delete);
   ASSERT_NE(session_config, nullptr);
   litert_lm_session_config_set_sampler_params(session_config.get(),
-                                              &sampler_params);
+                                              sampler_params.get());
 
   // 3. Create a Conversation Config with the Engine Handle, Session Config
   // and System Message.
@@ -726,17 +736,19 @@ TEST(EngineCTest, CreateConversationConfigWithNoSystemMessage) {
   ASSERT_NE(engine, nullptr);
 
   // 2. Create Sampler Params.
-  LiteRtLmSamplerParams sampler_params;
-  sampler_params.type = kLiteRtLmSamplerTypeTopP;
-  sampler_params.top_k = 10;
-  sampler_params.top_p = 0.5f;
-  sampler_params.temperature = 0.1f;
-  sampler_params.seed = 1234;
+  SamplerParamsPtr sampler_params(
+      litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP),
+      &litert_lm_sampler_params_delete);
+  ASSERT_NE(sampler_params, nullptr);
+  litert_lm_sampler_params_set_top_k(sampler_params.get(), 10);
+  litert_lm_sampler_params_set_top_p(sampler_params.get(), 0.5f);
+  litert_lm_sampler_params_set_temperature(sampler_params.get(), 0.1f);
+  litert_lm_sampler_params_set_seed(sampler_params.get(), 1234);
   SessionConfigPtr session_config(litert_lm_session_config_create(),
                                   &litert_lm_session_config_delete);
   ASSERT_NE(session_config, nullptr);
   litert_lm_session_config_set_sampler_params(session_config.get(),
-                                              &sampler_params);
+                                              sampler_params.get());
 
   // 3. Create a Conversation Config with the Session Config.
   ConversationConfigPtr conversation_config(
@@ -857,12 +869,14 @@ TEST(EngineCTest, GenerateContent) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
   ResponsesPtr responses(
-      litert_lm_session_generate_content(session.get(), &input_data, 1),
+      litert_lm_session_generate_content(session.get(), inputs, 1),
       &litert_lm_responses_delete);
   ASSERT_NE(responses, nullptr);
 
@@ -902,12 +916,14 @@ TEST(EngineCTest, CreateSessionWithMaxOutputTokens) {
     ASSERT_NE(session, nullptr);
 
     const char* prompt = "Hello world!";
-    LiteRtLmInputData input_data;
-    input_data.type = kLiteRtLmInputDataTypeText;
-    input_data.data = prompt;
-    input_data.size = strlen(prompt);
+    InputDataPtr input_data(
+        litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                    strlen(prompt)),
+        &litert_lm_input_data_delete);
+    ASSERT_NE(input_data, nullptr);
+    const LiteRtLmInputData* inputs[] = {input_data.get()};
     ResponsesPtr responses(
-        litert_lm_session_generate_content(session.get(), &input_data, 1),
+        litert_lm_session_generate_content(session.get(), inputs, 1),
         &litert_lm_responses_delete);
     ASSERT_NE(responses, nullptr);
 
@@ -931,12 +947,14 @@ TEST(EngineCTest, CreateSessionWithMaxOutputTokens) {
     ASSERT_NE(session, nullptr);
 
     const char* prompt = "Hello world!";
-    LiteRtLmInputData input_data;
-    input_data.type = kLiteRtLmInputDataTypeText;
-    input_data.data = prompt;
-    input_data.size = strlen(prompt);
+    InputDataPtr input_data(
+        litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                    strlen(prompt)),
+        &litert_lm_input_data_delete);
+    ASSERT_NE(input_data, nullptr);
+    const LiteRtLmInputData* inputs[] = {input_data.get()};
     ResponsesPtr responses(
-        litert_lm_session_generate_content(session.get(), &input_data, 1),
+        litert_lm_session_generate_content(session.get(), inputs, 1),
         &litert_lm_responses_delete);
     ASSERT_NE(responses, nullptr);
 
@@ -984,6 +1002,43 @@ TEST(EngineCTest, ConversationSendMessage) {
   EXPECT_GT(strlen(response_str), 0);
 }
 
+TEST(EngineCTest, ConversationRenderPreface) {
+  const std::string task_path = GetTestdataPath(
+      "litert_lm/runtime/testdata/test_lm.litertlm");
+
+  EngineSettingsPtr settings(
+      litert_lm_engine_settings_create(task_path.c_str(), "cpu",
+                                       /* vision_backend_str */ nullptr,
+                                       /* audio_backend_str */ nullptr),
+      &litert_lm_engine_settings_delete);
+  ASSERT_NE(settings, nullptr);
+  litert_lm_engine_settings_set_max_num_tokens(settings.get(), 16);
+
+  EnginePtr engine(litert_lm_engine_create(settings.get()),
+                   &litert_lm_engine_delete);
+  ASSERT_NE(engine, nullptr);
+
+  ConversationConfigPtr conversation_config(
+      litert_lm_conversation_config_create(),
+      &litert_lm_conversation_config_delete);
+  ASSERT_NE(conversation_config, nullptr);
+
+  const char* messages_json =
+      R"([{"role": "system", "content": "You are a helpful assistant."}])";
+  litert_lm_conversation_config_set_messages(conversation_config.get(),
+                                             messages_json);
+
+  ConversationPtr conversation(
+      litert_lm_conversation_create(engine.get(), conversation_config.get()),
+      &litert_lm_conversation_delete);
+  ASSERT_NE(conversation, nullptr);
+
+  const char* rendered =
+      litert_lm_conversation_render_preface_to_string(conversation.get());
+  ASSERT_NE(rendered, nullptr);
+  EXPECT_THAT(rendered, testing::HasSubstr("You are a helpful assistant."));
+}
+
 TEST(EngineCTest, ConversationSendMessageWithConfig) {
   // 1. Create an engine.
   const std::string task_path = GetTestdataPath(
@@ -1002,17 +1057,19 @@ TEST(EngineCTest, ConversationSendMessageWithConfig) {
   ASSERT_NE(engine, nullptr);
 
   // 2. Create Sampler Params.
-  LiteRtLmSamplerParams sampler_params;
-  sampler_params.type = kLiteRtLmSamplerTypeTopP;
-  sampler_params.top_k = 10;
-  sampler_params.top_p = 0.5f;
-  sampler_params.temperature = 0.1f;
-  sampler_params.seed = 1234;
+  SamplerParamsPtr sampler_params(
+      litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP),
+      &litert_lm_sampler_params_delete);
+  ASSERT_NE(sampler_params, nullptr);
+  litert_lm_sampler_params_set_top_k(sampler_params.get(), 10);
+  litert_lm_sampler_params_set_top_p(sampler_params.get(), 0.5f);
+  litert_lm_sampler_params_set_temperature(sampler_params.get(), 0.1f);
+  litert_lm_sampler_params_set_seed(sampler_params.get(), 1234);
   SessionConfigPtr session_config(litert_lm_session_config_create(),
                                   &litert_lm_session_config_delete);
   ASSERT_NE(session_config, nullptr);
   litert_lm_session_config_set_sampler_params(session_config.get(),
-                                              &sampler_params);
+                                              sampler_params.get());
 
   // 3. Create a Conversation Config with the Session Config
   // and System Message.
@@ -1226,13 +1283,15 @@ TEST(EngineCTest, GenerateContentStream) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
   StreamCallbackData callback_data;
   int result = litert_lm_session_generate_content_stream(
-      session.get(), &input_data, 1, &StreamCallback, &callback_data);
+      session.get(), inputs, 1, &StreamCallback, &callback_data);
   ASSERT_EQ(result, 0);
 
   callback_data.done.WaitForNotification();
@@ -1271,13 +1330,15 @@ TEST(EngineCTest, SessionGenerateContentStreamAndCancel) {
 
   const char* prompt =
       "Hello world! Write a long essay about the history of Rome.";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
   StreamCallbackData callback_data;
   int result = litert_lm_session_generate_content_stream(
-      session.get(), &input_data, 1, &StreamCallback, &callback_data);
+      session.get(), inputs, 1, &StreamCallback, &callback_data);
   ASSERT_EQ(result, 0);
 
   litert_lm_session_cancel_process(session.get());
@@ -1465,12 +1526,14 @@ TEST(EngineCTest, Benchmark) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
   ResponsesPtr responses(
-      litert_lm_session_generate_content(session.get(), &input_data, 1),
+      litert_lm_session_generate_content(session.get(), inputs, 1),
       &litert_lm_responses_delete);
   ASSERT_NE(responses, nullptr);
 
@@ -1533,13 +1596,14 @@ TEST(EngineCTest, RunPrefillSuccess) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
 
-  int prefill_result =
-      litert_lm_session_run_prefill(session.get(), &input_data, 1);
+  int prefill_result = litert_lm_session_run_prefill(session.get(), inputs, 1);
   EXPECT_EQ(prefill_result, 0);
 }
 
@@ -1565,12 +1629,14 @@ TEST(EngineCTest, RunPrefillAndDecode) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
 
-  litert_lm_session_run_prefill(session.get(), &input_data, 1);
+  litert_lm_session_run_prefill(session.get(), inputs, 1);
 
   ResponsesPtr responses(litert_lm_session_run_decode(session.get()),
                          &litert_lm_responses_delete);
@@ -1605,12 +1671,14 @@ TEST(EngineCTest, TextScoringBasic) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
 
-  litert_lm_session_run_prefill(session.get(), &input_data, 1);
+  litert_lm_session_run_prefill(session.get(), inputs, 1);
 
   const char* target_texts[] = {"apple"};
   ResponsesPtr responses(
@@ -1644,12 +1712,14 @@ TEST(EngineCTest, TextScoringVerifyScores) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
 
-  litert_lm_session_run_prefill(session.get(), &input_data, 1);
+  litert_lm_session_run_prefill(session.get(), inputs, 1);
 
   const char* target_texts[] = {"apple"};
   ResponsesPtr responses(
@@ -1683,12 +1753,14 @@ TEST(EngineCTest, TextScoringVerifyTokenLengths) {
   ASSERT_NE(session, nullptr);
 
   const char* prompt = "Hello world!";
-  LiteRtLmInputData input_data;
-  input_data.type = kLiteRtLmInputDataTypeText;
-  input_data.data = prompt;
-  input_data.size = strlen(prompt);
+  InputDataPtr input_data(
+      litert_lm_input_data_create(kLiteRtLmInputDataTypeText, prompt,
+                                  strlen(prompt)),
+      &litert_lm_input_data_delete);
+  ASSERT_NE(input_data, nullptr);
+  const LiteRtLmInputData* inputs[] = {input_data.get()};
 
-  litert_lm_session_run_prefill(session.get(), &input_data, 1);
+  litert_lm_session_run_prefill(session.get(), inputs, 1);
 
   const char* target_texts[] = {"apple"};
   ResponsesPtr responses(

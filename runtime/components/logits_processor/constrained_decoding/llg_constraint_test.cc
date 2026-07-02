@@ -21,15 +21,20 @@
 #include <gtest/gtest.h>
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/components/logits_processor/constrained_decoding/bitmap.h"
 #include "runtime/components/logits_processor/constrained_decoding/constraint.h"
 #include "runtime/components/logits_processor/constrained_decoding/constraint_provider.h"
 #include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/logits_processor/constrained_decoding/llg_constraint_provider.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/util/test_utils.h"  // NOLINT
 
 namespace litert::lm {
+
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+using TokenIds = ::litert::support::TokenIds;
+
 namespace {
 
 using ::testing::Return;
@@ -43,6 +48,7 @@ class MockTokenizer : public Tokenizer {
   MOCK_METHOD(absl::StatusOr<std::string>, TokenIdsToText, (const TokenIds&),
               (override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
+  MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
 class LlgConstraintTest : public ::testing::Test {
