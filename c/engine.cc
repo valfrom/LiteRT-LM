@@ -316,6 +316,7 @@ struct LiteRtLmConversationConfig {
   bool enable_constrained_decoding = false;
   bool enable_json_schema_constraints = false;
   bool prefill_preface_on_init = false;
+  bool defer_prefill_preface_on_init = false;
   std::optional<bool> audio_modality_enabled;
   std::optional<bool> vision_modality_enabled;
   bool filter_channel_content_from_kv_cache = false;
@@ -542,6 +543,13 @@ void litert_lm_conversation_config_set_prefill_preface_on_init(
     LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {
   if (config) {
     config->prefill_preface_on_init = prefill_preface_on_init;
+  }
+}
+
+void litert_lm_conversation_config_set_defer_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool defer_prefill_preface_on_init) {
+  if (config) {
+    config->defer_prefill_preface_on_init = defer_prefill_preface_on_init;
   }
 }
 
@@ -1328,7 +1336,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
                       << config.status();
       return nullptr;
     }
-    conversation = Conversation::Create(*engine->engine, *config);
+    conversation =
+        Conversation::Create(*engine->engine, *config,
+                             !c_config->defer_prefill_preface_on_init);
   } else {
     auto default_conversation_config =
         ConversationConfig::CreateDefault(*engine->engine);
@@ -1444,6 +1454,21 @@ int litert_lm_conversation_send_message_stream(
 
   if (!status.ok()) {
     ABSL_LOG(ERROR) << "Failed to start message stream: " << status;
+    return static_cast<int>(status.code());
+  }
+  return 0;
+}
+
+int litert_lm_conversation_prefill_preface_async(
+    LiteRtLmConversation* conversation, LiteRtLmStreamCallback callback,
+    void* callback_data) {
+  if (!conversation || !conversation->conversation || !callback) {
+    return -1;
+  }
+  auto status = conversation->conversation->PrefillPrefaceAsync(
+      CreateCallback(callback, callback_data));
+  if (!status.ok()) {
+    ABSL_LOG(ERROR) << "Failed to start preface prefill: " << status;
     return static_cast<int>(status.code());
   }
   return 0;

@@ -330,7 +330,8 @@ absl::StatusOr<DecodeConfig> Conversation::CreateDecodeConfig(
 }
 
 absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
-    Engine& engine, const ConversationConfig& config) {
+    Engine& engine, const ConversationConfig& config,
+    bool run_prefill_preface_on_init) {
   absl::Time start_time = absl::Now();
   if (!std::holds_alternative<JsonPreface>(config.GetPreface())) {
     return absl::InvalidArgumentError("Only JsonPreface is supported for now.");
@@ -356,45 +357,9 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
       engine, std::move(session), std::move(model_data_processor),
       config.GetPreface(), config.GetPromptTemplate(), config,
       std::move(constraint_provider)));
-  if (config.prefill_preface_on_init() &&
-      !IsEmptyPreface(config.GetPreface())) {
-    std::string single_turn_text;
-    std::vector<Message> tmp_history;
-    bool fallback =
-        !conversation->prompt_template_.GetCapabilities().supports_single_turn;
-    std::optional<nlohmann::ordered_json> extra_context = std::nullopt;
-    if (config.enable_thinking()) {
-      extra_context =
-          nlohmann::ordered_json::object({{"enable_thinking", true}});
-    }
-    const auto render_result =
-        conversation->model_data_processor_->RenderSingleTurnTemplate(
-            tmp_history, config.GetPreface(), Message(),
-            config.GetPromptTemplate(),
-            /*current_is_appending_message=*/false,
-            /*append_message=*/false, extra_context);
-    if (fallback || absl::IsUnimplemented(render_result.status())) {
-      // Fallback to the old way of prefilling the preface.
-      PromptTemplateInput tmpl_input;
-      RETURN_IF_ERROR(FillPrefaceForPromptTemplateInput(
-          config.GetPreface(), conversation->model_data_processor_.get(),
-          tmpl_input));
-      if (config.enable_thinking()) {
-        tmpl_input.extra_context["enable_thinking"] = true;
-      }
-      tmpl_input.add_generation_prompt = false;
-      ASSIGN_OR_RETURN(single_turn_text,
-                       conversation->ApplyTemplate(tmpl_input));
-    } else if (render_result.ok()) {
-      single_turn_text = render_result->text;
-    } else {
-      return render_result.status();
-    }
+  if (run_prefill_preface_on_init) {
     ASSIGN_OR_RETURN(const auto session_inputs,
-                     conversation->model_data_processor_->ToInputDataVector(
-                         single_turn_text,
-                         std::get<JsonPreface>(config.GetPreface()).messages,
-                         std::monostate()));
+                     conversation->GetPrefaceInputDataVector());
     if (!session_inputs.empty()) {
       RETURN_IF_ERROR(conversation->session_->RunPrefill(session_inputs));
     }
@@ -408,6 +373,56 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
   }
 
   return conversation;
+}
+
+absl::StatusOr<std::vector<InputData>>
+Conversation::GetPrefaceInputDataVector() {
+  if (!config_.prefill_preface_on_init() ||
+      IsEmptyPreface(config_.GetPreface())) {
+    return std::vector<InputData>();
+  }
+  std::string single_turn_text;
+  std::vector<Message> tmp_history;
+  bool fallback = !prompt_template_.GetCapabilities().supports_single_turn;
+  std::optional<nlohmann::ordered_json> extra_context = std::nullopt;
+  if (config_.enable_thinking()) {
+    extra_context = nlohmann::ordered_json::object({{"enable_thinking", true}});
+  }
+  const auto render_result = model_data_processor_->RenderSingleTurnTemplate(
+      tmp_history, config_.GetPreface(), Message(), config_.GetPromptTemplate(),
+      false, false, extra_context);
+  if (fallback || absl::IsUnimplemented(render_result.status())) {
+    PromptTemplateInput tmpl_input;
+    RETURN_IF_ERROR(FillPrefaceForPromptTemplateInput(
+        config_.GetPreface(), model_data_processor_.get(), tmpl_input));
+    if (config_.enable_thinking()) {
+      tmpl_input.extra_context["enable_thinking"] = true;
+    }
+    tmpl_input.add_generation_prompt = false;
+    ASSIGN_OR_RETURN(single_turn_text, ApplyTemplate(tmpl_input));
+  } else if (render_result.ok()) {
+    single_turn_text = render_result->text;
+  } else {
+    return render_result.status();
+  }
+  return model_data_processor_->ToInputDataVector(
+      single_turn_text, std::get<JsonPreface>(config_.GetPreface()).messages,
+      std::monostate());
+}
+
+absl::Status Conversation::PrefillPrefaceAsync(
+    absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+  ASSIGN_OR_RETURN(auto session_inputs, GetPrefaceInputDataVector());
+  if (session_inputs.empty()) {
+    callback(Responses(TaskState::kDone));
+    return absl::OkStatus();
+  }
+  ASSIGN_OR_RETURN(
+      auto task_controller,
+      session_->RunPrefillAsync(session_inputs, std::move(callback)));
+  AddTaskController(std::optional<std::string>("preface_prefill"),
+                    std::move(task_controller));
+  return absl::OkStatus();
 }
 
 void Conversation::AddTaskController(

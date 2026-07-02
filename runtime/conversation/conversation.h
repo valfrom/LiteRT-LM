@@ -520,7 +520,8 @@ class Conversation {
   // - `config`: The ConversationConfig instance to be used for creating the
   // Conversation.
   static absl::StatusOr<std::unique_ptr<Conversation>> Create(
-      Engine& engine, const ConversationConfig& config);
+      Engine& engine, const ConversationConfig& config,
+      bool run_prefill_preface_on_init = true);
 
   // Sends a message to the LLM and returns the complete message.
   // Args:
@@ -558,6 +559,9 @@ class Conversation {
       const Message& message,
       absl::AnyInvocable<void(absl::StatusOr<Message>)> user_callback,
       OptionalArgs optional_args = OptionalArgs());
+
+  absl::Status PrefillPrefaceAsync(
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback);
 
   // Scores the target text after the prefill process is done. This function
   // will run the decode process (with the existing context history) by feeding
@@ -694,6 +698,8 @@ class Conversation {
   absl::StatusOr<DecodeConfig> CreateDecodeConfig(
       std::optional<ConstraintArg> decoding_constraint = std::nullopt,
       std::optional<int> max_output_tokens = std::nullopt);
+
+  absl::StatusOr<std::vector<InputData>> GetPrefaceInputDataVector();
 
   // Adds a task controller to the task_controllers_ map if task_group_id is
   // provided.

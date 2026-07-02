@@ -258,6 +258,10 @@ void litert_lm_conversation_config_set_prefill_preface_on_init(
     LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
 
 LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_defer_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool defer_prefill_preface_on_init);
+
+LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_audio_modality_enabled(
     LiteRtLmConversationConfig* config, bool enabled);
 
@@ -936,6 +940,11 @@ int litert_lm_conversation_send_message_stream(
     const char* extra_context,
     const LiteRtLmConversationOptionalArgs* optional_args,
     LiteRtLmStreamCallback callback, void* callback_data);
+
+LITERT_LM_C_API_EXPORT
+int litert_lm_conversation_prefill_preface_async(
+    LiteRtLmConversation* conversation, LiteRtLmStreamCallback callback,
+    void* callback_data);
 
 // Renders the message into a string according to the template.
 //
