@@ -51,6 +51,7 @@
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler_factory.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/executor/common_utils.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/litert_compiled_model_executor_utils.h"
@@ -241,6 +242,7 @@ absl::Status ResolveDynamicShape(const Model& model,
 absl::StatusOr<TensorBuffer> ResizeKVCacheTensorBuffer(
     Environment& env, TensorBuffer& tensor_buffer, int dynamic_dim_index,
     int num_entries_to_insert) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   LITERT_ASSIGN_OR_RETURN(const RankedTensorType& tensor_type,
                           tensor_buffer.TensorType());
   RET_CHECK(!tensor_type.Layout().HasStrides());
@@ -325,6 +327,7 @@ absl::Span<const T> GetSpanForChunk(absl::Span<T> span, int num_chunks,
 absl::StatusOr<TensorBuffer> CreateFP16OutputBuffer(
     Environment& env, CompiledModel& compiled_model, size_t signature_index,
     absl::string_view output_name, size_t output_index) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   LITERT_ASSIGN_OR_RETURN(
       std::vector<Layout> runtime_layouts,
       compiled_model.GetOutputTensorLayouts(signature_index,
@@ -361,6 +364,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::CreatePrefillInputBuffers(
     int context_length,
     absl::flat_hash_map<absl::string_view, TensorBuffer>&
         prefill_input_buffers) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   auto dyn_shape_resolver = [&](absl::string_view tensor_name) -> absl::Status {
     return ResolveDynamicShape(model_, *compiled_model_, prefill_signature,
                                tensor_name, sequence_length);
@@ -716,6 +720,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunPrefill(
     absl::string_view prefill_signature,
     absl::flat_hash_map<absl::string_view, TensorBuffer>& prefill_input_buffers,
     bool async) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   absl::flat_hash_map<absl::string_view, TensorBuffer> input_buffers;
   for (const auto& [input_name, input_buffer] : prefill_input_buffers) {
     LITERT_ASSIGN_OR_RETURN(auto input_buffer_dup, input_buffer.Duplicate());
@@ -918,6 +923,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::DecodeInternal(
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
     TensorBuffer* output_logits) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers;
   for (const auto& [input_name, input_buffer] : decode_input_buffers_) {
     LITERT_ASSIGN_OR_RETURN(auto input_buffer_dup, input_buffer.Duplicate());
@@ -1417,6 +1423,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::SetSamplerInputHandling(
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::SampleLogits(
     const TensorBuffer& logits, TensorBuffer& ids_tensor) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused());
   if (sampler_ == nullptr) {
     LITERT_ASSIGN_OR_RETURN(auto logits_tensor_type, logits.TensorType());
     ActivationDataType logits_data_type;
@@ -1501,6 +1508,8 @@ absl::StatusOr<int> LlmLiteRtCompiledModelExecutorBase::GetVocabSize() {
 
 absl::Status LlmLiteRtCompiledModelExecutorStatic::Prefill(
     const ExecutorInputs& inputs, const ExecutorPrefillParams& params) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused(
+      params.GetCancelFlag()));
 
   int output_heads = 1;
   if (llm_context_->runtime_config().output_heads.has_value()) {
@@ -1846,6 +1855,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
 
 absl::Status LlmLiteRtCompiledModelExecutorDynamic::Prefill(
     const ExecutorInputs& inputs, const ExecutorPrefillParams& params) {
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused(
+      params.GetCancelFlag()));
 
   // Only accept batch size 1 for now.
   LITERT_RETURN_IF_ERROR(PrepareFirstPrefillAfterDecode(0));
@@ -1863,6 +1874,8 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::Prefill(
   }
 
   while (!ids.empty()) {
+    RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused(
+        params.GetCancelFlag()));
     if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
       return absl::CancelledError("Process cancelled.");
     }

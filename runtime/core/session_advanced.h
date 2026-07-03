@@ -33,6 +33,7 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "runtime/components/tokenizer.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -66,6 +67,7 @@ class SessionAdvanced : public SessionInterface {
 
     absl::Status Cancel() override {
       cancelled_->store(true);
+      GlobalEvalPauseController().Notify();
       return absl::OkStatus();
     }
 
@@ -164,6 +166,7 @@ class SessionAdvanced : public SessionInterface {
   // Conversation.
   void CancelProcess() override {
     ABSL_LOG(INFO) << "SessionAdvanced::CancelProcess";
+    GlobalEvalPauseController().Notify();
     auto execution_manager_lock = execution_manager_.lock();
     if (execution_manager_lock == nullptr) {
       ABSL_LOG(ERROR) << "Execution manager is not available.";

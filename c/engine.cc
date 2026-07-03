@@ -30,10 +30,12 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -108,7 +110,9 @@ std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
 
 litert::lm::OptionalArgs CreateOptionalArgs(
     const litert::lm::Conversation* conversation, const char* extra_context,
-    std::optional<int> visual_token_budget) {
+    std::optional<int> visual_token_budget,
+    std::optional<int> max_output_tokens,
+    absl::string_view json_schema_constraint) {
   litert::lm::OptionalArgs litert_lm_optional_args;
   if (extra_context) {
     auto extra_context_json =
@@ -120,6 +124,16 @@ litert::lm::OptionalArgs CreateOptionalArgs(
   if (visual_token_budget.has_value()) {
     litert_lm_optional_args.args =
         GetDataProcessorArguments(conversation, *visual_token_budget);
+  }
+  if (max_output_tokens.has_value()) {
+    litert_lm_optional_args.max_output_tokens = max_output_tokens;
+  }
+  if (!json_schema_constraint.empty()) {
+    litert_lm_optional_args.decoding_constraint =
+        litert::lm::LlGuidanceConstraintArg{
+            .constraint_type = litert::lm::LlgConstraintType::kJsonSchema,
+            .constraint_string = std::string(json_schema_constraint),
+        };
   }
   return litert_lm_optional_args;
 }
@@ -216,11 +230,18 @@ struct LiteRtLmConversationConfig {
   std::string messages_json;
   std::string extra_context_json;
   bool enable_constrained_decoding = false;
+  bool enable_json_schema_constraints = false;
+  bool prefill_preface_on_init = false;
+  bool defer_prefill_preface_on_init = false;
+  std::optional<bool> audio_modality_enabled;
+  std::optional<bool> vision_modality_enabled;
   bool filter_channel_content_from_kv_cache = false;
 };
 
 struct LiteRtLmConversationOptionalArgs {
   std::optional<int> visual_token_budget;
+  std::optional<int> max_output_tokens;
+  std::string json_schema_constraint;
 };
 
 struct LiteRtLmDetokenizeResult {
@@ -257,6 +278,49 @@ SamplerParameters::Type ToSamplerParametersType(LiteRtLmSamplerType type) {
       return SamplerParameters::GREEDY;
   }
   return SamplerParameters::TYPE_UNSPECIFIED;
+}
+
+LiteRtLmSamplerParams* litert_lm_sampler_params_create(
+    LiteRtLmSamplerType type) {
+  auto params = std::make_unique<LiteRtLmSamplerParams>();
+  params->type = type;
+  params->top_k = 0;
+  params->top_p = 0.0f;
+  params->temperature = 0.0f;
+  params->seed = 0;
+  return params.release();
+}
+
+void litert_lm_sampler_params_delete(LiteRtLmSamplerParams* params) {
+  delete params;
+}
+
+void litert_lm_sampler_params_set_top_k(LiteRtLmSamplerParams* params,
+                                        int32_t top_k) {
+  if (params) {
+    params->top_k = top_k;
+  }
+}
+
+void litert_lm_sampler_params_set_top_p(LiteRtLmSamplerParams* params,
+                                        float top_p) {
+  if (params) {
+    params->top_p = top_p;
+  }
+}
+
+void litert_lm_sampler_params_set_temperature(LiteRtLmSamplerParams* params,
+                                              float temperature) {
+  if (params) {
+    params->temperature = temperature;
+  }
+}
+
+void litert_lm_sampler_params_set_seed(LiteRtLmSamplerParams* params,
+                                       int32_t seed) {
+  if (params) {
+    params->seed = seed;
+  }
 }
 
 LiteRtLmSessionConfig* litert_lm_session_config_create() {
@@ -346,6 +410,41 @@ void litert_lm_conversation_config_set_enable_constrained_decoding(
   }
 }
 
+void litert_lm_conversation_config_set_enable_json_schema_constraints(
+    LiteRtLmConversationConfig* config, bool enable_json_schema_constraints) {
+  if (config) {
+    config->enable_json_schema_constraints = enable_json_schema_constraints;
+  }
+}
+
+void litert_lm_conversation_config_set_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {
+  if (config) {
+    config->prefill_preface_on_init = prefill_preface_on_init;
+  }
+}
+
+void litert_lm_conversation_config_set_defer_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool defer_prefill_preface_on_init) {
+  if (config) {
+    config->defer_prefill_preface_on_init = defer_prefill_preface_on_init;
+  }
+}
+
+void litert_lm_conversation_config_set_audio_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled) {
+  if (config) {
+    config->audio_modality_enabled = enabled;
+  }
+}
+
+void litert_lm_conversation_config_set_vision_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled) {
+  if (config) {
+    config->vision_modality_enabled = enabled;
+  }
+}
+
 void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
     LiteRtLmConversationConfig* config,
     bool filter_channel_content_from_kv_cache) {
@@ -368,6 +467,20 @@ void litert_lm_conversation_optional_args_set_visual_token_budget(
     LiteRtLmConversationOptionalArgs* args, int visual_token_budget) {
   if (args) {
     args->visual_token_budget = visual_token_budget;
+  }
+}
+
+void litert_lm_conversation_optional_args_set_max_output_tokens(
+    LiteRtLmConversationOptionalArgs* args, int max_output_tokens) {
+  if (args) {
+    args->max_output_tokens = max_output_tokens;
+  }
+}
+
+void litert_lm_conversation_optional_args_set_json_schema_constraint(
+    LiteRtLmConversationOptionalArgs* args, const char* schema_json) {
+  if (args && schema_json) {
+    args->json_schema_constraint = schema_json;
   }
 }
 
@@ -554,6 +667,24 @@ LiteRtLmEngine* litert_lm_engine_create(
 }
 
 void litert_lm_engine_delete(LiteRtLmEngine* engine) { delete engine; }
+
+void litert_lm_pause_eval() { litert::lm::GlobalEvalPauseController().Pause(); }
+
+void litert_lm_resume_eval() {
+  litert::lm::GlobalEvalPauseController().Resume();
+}
+
+void litert_lm_engine_pause_eval(LiteRtLmEngine* engine) {
+  if (engine && engine->engine) {
+    litert_lm_pause_eval();
+  }
+}
+
+void litert_lm_engine_resume_eval(LiteRtLmEngine* engine) {
+  if (engine && engine->engine) {
+    litert_lm_resume_eval();
+  }
+}
 
 LiteRtLmSession* litert_lm_engine_create_session(
     LiteRtLmEngine* engine, LiteRtLmSessionConfig* config) {
@@ -963,10 +1094,22 @@ LiteRtLmConversation* litert_lm_conversation_create(
             .has_value()) {
       session_config.SetVisionModalityEnabled(true);
     }
+    if (c_config->audio_modality_enabled.has_value()) {
+      session_config.SetAudioModalityEnabled(
+          c_config->audio_modality_enabled.value());
+    }
+    if (c_config->vision_modality_enabled.has_value()) {
+      session_config.SetVisionModalityEnabled(
+          c_config->vision_modality_enabled.value());
+    }
     builder.SetSessionConfig(session_config);
 
     builder.SetPreface(json_preface);
+    builder.SetPrefillPrefaceOnInit(c_config->prefill_preface_on_init);
     builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
+    if (c_config->enable_json_schema_constraints) {
+      builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig());
+    }
     builder.SetFilterChannelContentFromKvCache(
         c_config->filter_channel_content_from_kv_cache);
     auto config = builder.Build(*engine->engine);
@@ -976,7 +1119,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
                       << config.status();
       return nullptr;
     }
-    conversation = Conversation::Create(*engine->engine, *config);
+    conversation =
+        Conversation::Create(*engine->engine, *config,
+                             !c_config->defer_prefill_preface_on_init);
   } else {
     auto default_conversation_config =
         ConversationConfig::CreateDefault(*engine->engine);
@@ -1036,7 +1181,10 @@ LiteRtLmJsonResponse* litert_lm_conversation_send_message(
   OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
       conversation->conversation.get(), extra_context,
       optional_args ? std::optional<int>(optional_args->visual_token_budget)
-                    : std::nullopt);
+                    : std::nullopt,
+      optional_args ? optional_args->max_output_tokens : std::nullopt,
+      optional_args ? absl::string_view(optional_args->json_schema_constraint)
+                    : absl::string_view());
 
   auto response = conversation->conversation->SendMessage(
       json_message, std::move(litert_lm_optional_args));
@@ -1080,7 +1228,10 @@ int litert_lm_conversation_send_message_stream(
   litert::lm::OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
       conversation->conversation.get(), extra_context,
       optional_args ? std::optional<int>(optional_args->visual_token_budget)
-                    : std::nullopt);
+                    : std::nullopt,
+      optional_args ? optional_args->max_output_tokens : std::nullopt,
+      optional_args ? absl::string_view(optional_args->json_schema_constraint)
+                    : absl::string_view());
 
   absl::Status status = conversation->conversation->SendMessageAsync(
       json_message, CreateConversationCallback(callback, callback_data),
@@ -1088,6 +1239,21 @@ int litert_lm_conversation_send_message_stream(
 
   if (!status.ok()) {
     ABSL_LOG(ERROR) << "Failed to start message stream: " << status;
+    return static_cast<int>(status.code());
+  }
+  return 0;
+}
+
+int litert_lm_conversation_prefill_preface_async(
+    LiteRtLmConversation* conversation, LiteRtLmStreamCallback callback,
+    void* callback_data) {
+  if (!conversation || !conversation->conversation || !callback) {
+    return -1;
+  }
+  auto status = conversation->conversation->PrefillPrefaceAsync(
+      CreateCallback(callback, callback_data));
+  if (!status.ok()) {
+    ABSL_LOG(ERROR) << "Failed to start preface prefill: " << status;
     return static_cast<int>(status.code());
   }
   return 0;

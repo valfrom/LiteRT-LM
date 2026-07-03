@@ -162,6 +162,15 @@ alias(
 )
 
 cc_library(
+    name = "eval_pause",
+    srcs = ["eval_pause.cc"],
+    hdrs = ["eval_pause.h"],
+    deps = [
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
     name = "pipeline",
     srcs = ["pipeline.cc"],
     hdrs = ["pipeline.h"],
@@ -229,6 +238,7 @@ cc_library(
     srcs = ["session_advanced.cc"],
     hdrs = ["session_advanced.h"],
     deps = [
+        ":eval_pause",
         ":session_utils",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",
@@ -363,6 +373,7 @@ cc_library(
     srcs = ["tasks.cc"],
     hdrs = ["tasks.h"],
     deps = [
+        ":eval_pause",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log:absl_log",

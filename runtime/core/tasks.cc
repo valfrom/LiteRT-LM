@@ -43,6 +43,7 @@
 #include "runtime/components/scoring_cpu_util.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
@@ -414,6 +415,8 @@ absl::StatusOr<Responses> Prefill(
     LlmExecutor& executor, ExecutorInputs& inputs, bool wait_for_completion,
     std::optional<BenchmarkInfo>& benchmark_info,
     const std::atomic_bool* cancelled) {
+  EvalPauseCancellationScope pause_scope(cancelled);
+  RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused(cancelled));
   absl::StatusOr<int> start_step =
       cancelled == nullptr ? absl::StatusOr<int>(0) : executor.GetCurrentStep();
   auto cancelled_response = [&]() {
@@ -474,6 +477,7 @@ absl::StatusOr<Responses> Decode(
     std::optional<litert::TensorBuffer> decoded_ids,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)>& callback,
     std::atomic<bool>* cancelled, int max_output_tokens) {
+  EvalPauseCancellationScope pause_scope(cancelled);
   const bool is_streaming = callback != nullptr;
   const bool is_custom_sampling = sampler.has_value();
 
@@ -507,6 +511,7 @@ absl::StatusOr<Responses> Decode(
                              stop_token_detector, benchmark_info, sampler,
                              constraint);
   while (true) {
+    RETURN_IF_ERROR(GlobalEvalPauseController().WaitIfPaused(cancelled));
     if (cancelled != nullptr && cancelled->load()) {
       if (benchmark_info.has_value()) {
         ASSIGN_OR_RETURN(int current_step, executor.GetCurrentStep());
@@ -526,8 +531,9 @@ absl::StatusOr<Responses> Decode(
         std::optional<BenchmarkInfo> unused_benchmark_info;
         ASSIGN_OR_RETURN(auto current_step, executor.GetCurrentStep());
         RETURN_IF_ERROR(executor.SetCurrentStep(current_step - 1));
-        auto status = Prefill(executor, inputs, /*wait_for_completion=*/true,
-                              unused_benchmark_info);
+        auto status =
+            Prefill(executor, inputs, /*wait_for_completion=*/true,
+                    unused_benchmark_info, cancelled);
         if (!status.ok()) {
           return status.status();
         }
@@ -615,8 +621,9 @@ absl::StatusOr<Responses> Decode(
     std::optional<BenchmarkInfo> unused_benchmark_info;
     ASSIGN_OR_RETURN(auto current_step, executor.GetCurrentStep());
     RETURN_IF_ERROR(executor.SetCurrentStep(current_step - 1));
-    auto status = Prefill(executor, inputs, /*wait_for_completion=*/true,
-                          unused_benchmark_info);
+    auto status =
+        Prefill(executor, inputs, /*wait_for_completion=*/true,
+                unused_benchmark_info, cancelled);
     if (!status.ok()) {
       return status.status();
     }

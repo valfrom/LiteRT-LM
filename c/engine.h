@@ -106,14 +106,36 @@ typedef enum {
   kLiteRtLmSamplerTypeGreedy = 3,
 } LiteRtLmSamplerType;
 
-// Parameters for the sampler.
-typedef struct {
+typedef struct LiteRtLmSamplerParams {
   LiteRtLmSamplerType type;
   int32_t top_k;
   float top_p;
   float temperature;
   int32_t seed;
 } LiteRtLmSamplerParams;
+
+LITERT_LM_C_API_EXPORT
+LiteRtLmSamplerParams* litert_lm_sampler_params_create(
+    LiteRtLmSamplerType type);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_delete(LiteRtLmSamplerParams* params);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_top_k(LiteRtLmSamplerParams* params,
+                                        int32_t top_k);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_top_p(LiteRtLmSamplerParams* params,
+                                        float top_p);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_temperature(LiteRtLmSamplerParams* params,
+                                              float temperature);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_seed(LiteRtLmSamplerParams* params,
+                                       int32_t seed);
 
 // Creates a LiteRT LM Session Config.
 // The caller is responsible for destroying the config using
@@ -199,6 +221,26 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_enable_constrained_decoding(
     LiteRtLmConversationConfig* config, bool enable_constrained_decoding);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_enable_json_schema_constraints(
+    LiteRtLmConversationConfig* config, bool enable_json_schema_constraints);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_defer_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool defer_prefill_preface_on_init);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_audio_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_vision_modality_enabled(
+    LiteRtLmConversationConfig* config, bool enabled);
+
 // Sets whether to filter channel content from the KV cache.
 // @param config The config to modify.
 // @param filter_channel_content_from_kv_cache Whether to filter channel
@@ -232,6 +274,14 @@ void litert_lm_conversation_optional_args_delete(
 LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_optional_args_set_visual_token_budget(
     LiteRtLmConversationOptionalArgs* optional_args, int visual_token_budget);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_set_max_output_tokens(
+    LiteRtLmConversationOptionalArgs* optional_args, int max_output_tokens);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_set_json_schema_constraint(
+    LiteRtLmConversationOptionalArgs* optional_args, const char* schema_json);
 
 // Sets the minimum log level for the LiteRT LM library.
 // Log levels are: 0=VERBOSE, 1=DEBUG, 2=INFO, 3=WARNING, 4=ERROR, 5=FATAL,
@@ -384,6 +434,18 @@ LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* settings);
 // @param engine The engine to destroy.
 LITERT_LM_C_API_EXPORT
 void litert_lm_engine_delete(LiteRtLmEngine* engine);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_pause_eval(void);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_resume_eval(void);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_pause_eval(LiteRtLmEngine* engine);
+
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_resume_eval(LiteRtLmEngine* engine);
 
 // Creates a LiteRT LM Session. The caller is responsible for destroying the
 // session using `litert_lm_session_delete`.
@@ -763,6 +825,11 @@ int litert_lm_conversation_send_message_stream(
     const char* extra_context,
     const LiteRtLmConversationOptionalArgs* optional_args,
     LiteRtLmStreamCallback callback, void* callback_data);
+
+LITERT_LM_C_API_EXPORT
+int litert_lm_conversation_prefill_preface_async(
+    LiteRtLmConversation* conversation, LiteRtLmStreamCallback callback,
+    void* callback_data);
 
 // Renders the message into a string according to the template.
 //

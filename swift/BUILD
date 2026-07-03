@@ -32,6 +32,7 @@ swift_library(
         "Config.swift",
         "Conversation.swift",
         "Engine.swift",
+        "EvalPause.swift",
         "ExperimentalFlags.swift",
         "LiteRTLMError.swift",
         "Message.swift",

@@ -44,6 +44,7 @@
 #include "runtime/components/sampler_factory.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
+#include "runtime/core/eval_pause.h"
 #include "runtime/core/tasks.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -238,6 +239,7 @@ absl::Status SerialExecutionManager::CancelAllTasksInSession(
   for (TaskId task_id : session_lookup_.at(session_id)->active_tasks) {
     task_lookup_.at(task_id).cancelled->store(true);
   }
+  GlobalEvalPauseController().Notify();
   return absl::OkStatus();
 }
 

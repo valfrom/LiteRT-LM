@@ -16,6 +16,25 @@
 set(PKG_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ==============================================================================
+# 0. Eval Pause
+# ==============================================================================
+add_litertlm_library(runtime_core_eval_pause STATIC
+  eval_pause.cc
+)
+add_library(LiteRTLM::Runtime::Core::EvalPause ALIAS runtime_core_eval_pause)
+
+target_include_directories(runtime_core_eval_pause
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_core_eval_pause
+  PUBLIC
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # 1. Tasks
 # ==============================================================================
 add_litertlm_library(runtime_core_tasks STATIC
@@ -31,6 +50,7 @@ target_include_directories(runtime_core_tasks
 
 target_link_libraries(runtime_core_tasks
   PUBLIC
+    runtime_core_eval_pause
     LiteRTLM::Runtime::Components::Sampler::Interface
     LiteRTLM::Runtime::Components::ScoringCpuUtil
     LiteRTLM::Runtime::Components::StopTokenDetector

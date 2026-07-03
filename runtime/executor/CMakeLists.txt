@@ -407,6 +407,7 @@ target_link_libraries(runtime_executor_llm_litert_compiled_model_executor_factor
     LiteRTLM::Runtime::Components::Sampler::Interface
     LiteRTLM::Runtime::Components::Sampler::Factory
     LiteRTLM::Runtime::Components::EmbeddingLookup::Manager
+    LiteRTLM::Runtime::Core::EvalPause
     runtime_util_convert_tensor_buffer
     runtime_util_file_util
     runtime_util_litert_status_util

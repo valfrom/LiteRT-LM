@@ -286,6 +286,7 @@ cc_library(
         "//runtime/components:sampler",
         "//runtime/components:sampler_factory",
         "//runtime/components/embedding_lookup:embedding_lookup_manager",
+        "//runtime/core:eval_pause",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
         "//runtime/util:log_tensor_buffer",

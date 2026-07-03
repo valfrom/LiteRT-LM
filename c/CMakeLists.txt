@@ -37,6 +37,7 @@ target_link_libraries(c_engine
     LiteRTLM::Runtime::Conversation
     LiteRTLM::Runtime::Conversation::IoTypes
     LiteRTLM::Runtime::Core::EngineImpl
+    LiteRTLM::Runtime::Core::EvalPause
     LiteRTLM::Runtime::Engine::Interface
     LiteRTLM::Runtime::Engine::Settings
     LiteRTLM::Runtime::Engine::IoTypes
