@@ -29,6 +29,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/synchronization/notification.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "runtime/components/constrained_decoding/fake_constraint.h"
@@ -174,6 +175,36 @@ TEST_F(TasksTest, PrefillSucceed) {
 
   EXPECT_OK(task_response);
   EXPECT_EQ(task_response->GetTaskState(), TaskState::kDone);
+}
+
+TEST_F(TasksTest, PrefillCancelled) {
+  const std::string prompt = "Hello World!";
+  std::optional<BenchmarkInfo> benchmark_info;
+  std::atomic_bool cancelled = false;
+
+  ASSERT_OK_AND_ASSIGN(std::vector<int> token_ids,
+                       tokenizer_->TextToTokenIds(prompt));
+  token_ids.insert(token_ids.begin(), 2);
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  absl::StatusOr<Responses> task_response =
+      absl::UnknownError("Prefill did not run.");
+  ThreadPool pool("prefill_cancel", 1);
+  absl::Notification done;
+
+  ASSERT_OK(pool.Schedule([&]() {
+    task_response =
+        Tasks::Prefill(*executor_, inputs, true, benchmark_info, &cancelled);
+    done.Notify();
+  }));
+  absl::SleepFor(absl::Milliseconds(50));
+  cancelled = true;
+
+  ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+  ASSERT_OK(task_response);
+  EXPECT_EQ(task_response->GetTaskState(), TaskState::kCancelled);
 }
 
 TEST_F(TasksTest, DecodeSucceed) {

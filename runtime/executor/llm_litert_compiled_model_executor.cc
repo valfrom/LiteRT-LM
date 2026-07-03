@@ -543,7 +543,10 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::PrepareFirstPrefillAfterDecode(
 absl::Status LlmLiteRtCompiledModelExecutorBase::PrefillInternal(
     absl::string_view prefill_signature,
     absl::flat_hash_map<absl::string_view, TensorBuffer>& prefill_input_buffers,
-    Span<const int> ids, bool async) {
+    Span<const int> ids, bool async, const std::atomic_bool* cancelled) {
+  if (cancelled != nullptr && cancelled->load()) {
+    return absl::CancelledError("Process cancelled.");
+  }
   RETURN_IF_ERROR(RollBackProcessedTokens());
 
   {
@@ -701,6 +704,9 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::PrefillInternal(
     if (skip_prefill) {
       return absl::OkStatus();
     }
+  }
+  if (cancelled != nullptr && cancelled->load()) {
+    return absl::CancelledError("Process cancelled.");
   }
   return BindTensorsAndRunPrefill(prefill_signature, prefill_input_buffers,
                                   async);
@@ -1527,9 +1533,15 @@ absl::Status LlmLiteRtCompiledModelExecutorStatic::Prefill(
   // Reduce the input ids only with one user selected.
   auto input_length = ids.size() / input_batch_size;
   ids = ids.subspan(kTokenIndexToReduce * input_length, input_length);
+  if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+    return absl::CancelledError("Process cancelled.");
+  }
   ASSIGN_OR_RETURN(auto work_groups, GetOptimizedPrefillWorkGroups(
                                          prefill_signature_map_, ids.size()));
   for (int i = 0; i < work_groups.size(); ++i) {
+    if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+      return absl::CancelledError("Process cancelled.");
+    }
     const auto& prefill_signature = work_groups[i].first;
     int prefill_length = work_groups[i].second;
     // Keep track of the signatures that have already had their buffers
@@ -1551,7 +1563,8 @@ absl::Status LlmLiteRtCompiledModelExecutorStatic::Prefill(
                  (i < work_groups.size() - 1 || !params.GetWaitForCompletion());
     RETURN_IF_ERROR(PrefillInternal(
         prefill_signature, prefill_input_buffers_[prefill_signature],
-        ids.subspan(/*pos=*/0, prefill_length), async));
+        ids.subspan(/*pos=*/0, prefill_length), async,
+        params.GetCancelFlag()));
     ids = ids.subspan(/*pos=*/prefill_length);
   }
   RET_CHECK_EQ(ids.size(), 0).SetCode(absl::StatusCode::kInternal)
@@ -1850,6 +1863,9 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::Prefill(
   }
 
   while (!ids.empty()) {
+    if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+      return absl::CancelledError("Process cancelled.");
+    }
     int chunk_size =
         std::min(static_cast<int>(ids.size()), prefill_chunk_size_);
     absl::Span<int> chunk_ids = ids.first(chunk_size);
@@ -1953,9 +1969,12 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
   input_kv_cache_buffers_ = &kv_cache_buffers_1_;
   output_kv_cache_buffers_ = &kv_cache_buffers_1_;
 
+  if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+    return absl::CancelledError("Process cancelled.");
+  }
   bool async = !params.GetWaitForCompletion();
   return LlmLiteRtCompiledModelExecutorBase::PrefillInternal(
-      "prefill", prefill_input_buffers, ids, async);
+      "prefill", prefill_input_buffers, ids, async, params.GetCancelFlag());
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(

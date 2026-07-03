@@ -161,11 +161,19 @@ absl::Status FakeLlmExecutor::Prefill(const ExecutorInputs& inputs) {
 absl::Status FakeLlmExecutor::Prefill(
     const ExecutorInputs& inputs, const ExecutorPrefillParams& prefill_params) {
   RETURN_IF_ERROR(prefill_status_);
+  if (prefill_params.GetCancelFlag() != nullptr &&
+      prefill_params.GetCancelFlag()->load()) {
+    return absl::CancelledError("Process cancelled.");
+  }
   if (prefill_params.GetWaitForCompletion()) {
     // Sleep some time here to simulate a synchronous prefill.
     // We can time the function time in test to make sure the code calls prefill
     // with a correct wait_for_completion flag.
     absl::SleepFor(absl::Milliseconds(100));
+  }
+  if (prefill_params.GetCancelFlag() != nullptr &&
+      prefill_params.GetCancelFlag()->load()) {
+    return absl::CancelledError("Process cancelled.");
   }
   return Prefill(inputs);
 }

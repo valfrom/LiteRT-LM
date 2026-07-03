@@ -770,7 +770,8 @@ absl::Status ThreadedExecutionManager::AddPrefillTask(
     auto responses =
         Tasks::Prefill(*llm_executor.value(), *executor_inputs,
                        /*wait_for_completion=*/true,
-                       /*benchmark_info=*/session_info->benchmark_info);
+                       /*benchmark_info=*/session_info->benchmark_info,
+                       cancelled.get());
     if (!responses.ok()) {
       llm_executor.value().reset();
       FinishTaskAndLogErrors(task_id, responses.status(), std::move(callback));

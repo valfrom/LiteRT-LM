@@ -412,7 +412,19 @@ class DecodeOneStep {
 
 absl::StatusOr<Responses> Prefill(
     LlmExecutor& executor, ExecutorInputs& inputs, bool wait_for_completion,
-    std::optional<BenchmarkInfo>& benchmark_info) {
+    std::optional<BenchmarkInfo>& benchmark_info,
+    const std::atomic_bool* cancelled) {
+  absl::StatusOr<int> start_step =
+      cancelled == nullptr ? absl::StatusOr<int>(0) : executor.GetCurrentStep();
+  auto cancelled_response = [&]() {
+    if (cancelled != nullptr && start_step.ok()) {
+      executor.SetCurrentStep(*start_step).IgnoreError();
+    }
+    return Responses(TaskState::kCancelled);
+  };
+  if (cancelled != nullptr && cancelled->load()) {
+    return cancelled_response();
+  }
   const int max_num_tokens = TryGetMaxNumTokens(executor);
   ASSIGN_OR_RETURN(auto text_data, inputs.GetTextDataPtr());
   RET_CHECK(text_data != nullptr) << "text_data must not be null.";
@@ -431,14 +443,25 @@ absl::StatusOr<Responses> Prefill(
     return absl::InternalError("Input token ids are empty.");
   }
   ExecutorPrefillParams params;
+  params.SetCancelFlag(cancelled);
   // Wait for prefill to complete if benchmark mode is enabled.
   params.SetWaitForCompletion(wait_for_completion | benchmark_info.has_value());
   if (benchmark_info.has_value()) {
     RETURN_IF_ERROR(benchmark_info->TimePrefillTurnStart());
   }
-  RETURN_IF_ERROR(executor.Prefill(inputs, params));
+  auto status = executor.Prefill(inputs, params);
+  if (!status.ok()) {
+    if (absl::IsCancelled(status) && cancelled != nullptr &&
+        cancelled->load()) {
+      return cancelled_response();
+    }
+    return status;
+  }
   if (benchmark_info.has_value()) {
     RETURN_IF_ERROR(benchmark_info->TimePrefillTurnEnd(ids_buffer_span.size()));
+  }
+  if (cancelled != nullptr && cancelled->load()) {
+    return cancelled_response();
   }
   return Responses(TaskState::kDone);
 }

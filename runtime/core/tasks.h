@@ -36,7 +36,8 @@ namespace litert::lm::Tasks {
 
 absl::StatusOr<Responses> Prefill(LlmExecutor& executor, ExecutorInputs& inputs,
                                   bool wait_for_completion,
-                                  std::optional<BenchmarkInfo>& benchmark_info);
+                                  std::optional<BenchmarkInfo>& benchmark_info,
+                                  const std::atomic_bool* cancelled = nullptr);
 
 absl::StatusOr<Responses> Decode(
     LlmExecutor& executor, Tokenizer& tokenizer,

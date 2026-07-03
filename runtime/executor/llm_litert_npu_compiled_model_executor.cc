@@ -1455,10 +1455,16 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
   LITERT_ASSIGN_OR_RETURN(auto ids,
                           ReferTensorBufferAsSpan<int32_t>(*text_token_ids));
 
+  if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+    return absl::CancelledError("Process cancelled.");
+  }
   LITERT_ASSIGN_OR_RETURN(
       auto work_groups,
       GetOptimizedPrefillWorkGroups(prefill_signature_map_, ids.size()));
   for (const auto& [prefill_signature, prefill_length] : work_groups) {
+    if (params.GetCancelFlag() != nullptr && params.GetCancelFlag()->load()) {
+      return absl::CancelledError("Process cancelled.");
+    }
     RETURN_IF_ERROR(PrefillInternal(prefill_signature,
                                     ids.subspan(/*pos=*/0, prefill_length)));
     ids = ids.subspan(/*pos=*/prefill_length);
