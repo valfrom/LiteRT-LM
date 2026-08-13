@@ -54,6 +54,7 @@ set_platform_metadata() {
   set_plist_string DTXcodeBuild "$xcode_build"
 }
 
+clitert_binaries=()
 for framework in "$CLITERT_WORK_DIR"/CLiteRTLM.xcframework/*/CLiteRTLM.framework; do
   identifier="$(basename "$(dirname "$framework")")"
   binary="$framework/CLiteRTLM"
@@ -69,7 +70,10 @@ for framework in "$CLITERT_WORK_DIR"/CLiteRTLM.xcframework/*/CLiteRTLM.framework
   else
     set_platform_metadata "$framework/Info.plist" iphonesimulator iPhoneSimulator
   fi
+  clitert_binaries+=("$binary")
 done
+xcrun swift -module-cache-path "$WORK_DIR/swift-module-cache" \
+  "$ROOT/swiftpm/fix_gtm_logger_classes.swift" "${clitert_binaries[@]}"
 
 (cd "$CLITERT_WORK_DIR" && zip -r -X "$OUT_DIR/CLiteRTLM.xcframework.zip" CLiteRTLM.xcframework) >/dev/null
 
@@ -134,21 +138,27 @@ create_framework() {
 
 for name in GemmaModelConstraintProvider LiteRt LiteRtMetalAccelerator LiteRtTopKMetalSampler; do
   args=()
+  framework_binaries=()
   macos_library="$ROOT/prebuilt/macos_arm64/lib${name}.dylib"
   if [ -f "$macos_library" ]; then
     framework="$(create_framework "$name" macos_arm64 "$macos_library" macosx MacOSX 12.0)"
     args+=(-framework "$framework")
+    framework_binaries+=("$framework/$name")
   fi
   ios_library="$ROOT/prebuilt/ios_arm64/lib${name}.dylib"
   if [ -f "$ios_library" ]; then
     framework="$(create_framework "$name" ios_arm64 "$ios_library" iphoneos iPhoneOS "$IOS_MINIMUM_OS_VERSION")"
     args+=(-framework "$framework")
+    framework_binaries+=("$framework/$name")
   fi
   simulator_library="$ROOT/prebuilt/ios_sim_arm64/lib${name}.dylib"
   if [ -f "$simulator_library" ]; then
     framework="$(create_framework "$name" ios_sim_arm64 "$simulator_library" iphonesimulator iPhoneSimulator "$IOS_MINIMUM_OS_VERSION")"
     args+=(-framework "$framework")
+    framework_binaries+=("$framework/$name")
   fi
+  xcrun swift -module-cache-path "$WORK_DIR/swift-module-cache" \
+    "$ROOT/swiftpm/fix_gtm_logger_classes.swift" "${framework_binaries[@]}"
   xcodebuild -create-xcframework "${args[@]}" -output "$WORK_DIR/${name}.xcframework"
   (cd "$WORK_DIR" && zip -r -X "$OUT_DIR/${name}.xcframework.zip" "${name}.xcframework") >/dev/null
 done
