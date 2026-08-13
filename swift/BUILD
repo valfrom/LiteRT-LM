@@ -133,7 +133,7 @@ apple_xcframework(
         ],
     },
     minimum_os_versions = {
-        "ios": "15.0",
+        "ios": "16.0",
     },
     public_hdrs = [
         "//c:engine.h",

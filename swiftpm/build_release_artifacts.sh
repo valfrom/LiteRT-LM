@@ -8,6 +8,7 @@ WORK_DIR="${WORK_DIR:-$OUT_DIR/work}"
 BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/bazel-output-base}"
 BAZEL_LINK_PREFIX="${BAZEL_LINK_PREFIX:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/bazel-links/}"
 BAZEL_VERSION="$(bazel --version)"
+IOS_MINIMUM_OS_VERSION="16.0"
 
 if [ "$BAZEL_VERSION" != "bazel 7.6.1" ]; then
   echo "Expected bazel 7.6.1, got $BAZEL_VERSION" >&2
@@ -87,6 +88,17 @@ create_framework() {
   cp "$library" "$binary"
   codesign --remove-signature "$binary" 2>/dev/null || true
   install_name_tool -id "@rpath/$name.framework/$name" "$binary"
+  if [ "$sdk" = "iphoneos" ] || [ "$sdk" = "iphonesimulator" ]; then
+    local platform="ios"
+    if [ "$sdk" = "iphonesimulator" ]; then
+      platform="iossim"
+    fi
+    local binary_sdk="$(vtool -show-build "$binary" | awk '/sdk/ {print $2; exit}')"
+    local versioned_binary="${binary}.versioned"
+    vtool -set-build-version "$platform" "$IOS_MINIMUM_OS_VERSION" "$binary_sdk" \
+      -replace -output "$versioned_binary" "$binary"
+    mv "$versioned_binary" "$binary"
+  fi
   plutil -create xml1 "$plist"
   /usr/libexec/PlistBuddy \
     -c "Add :CFBundleDevelopmentRegion string en" \
@@ -129,12 +141,12 @@ for name in GemmaModelConstraintProvider LiteRt LiteRtMetalAccelerator LiteRtTop
   fi
   ios_library="$ROOT/prebuilt/ios_arm64/lib${name}.dylib"
   if [ -f "$ios_library" ]; then
-    framework="$(create_framework "$name" ios_arm64 "$ios_library" iphoneos iPhoneOS 15.0)"
+    framework="$(create_framework "$name" ios_arm64 "$ios_library" iphoneos iPhoneOS "$IOS_MINIMUM_OS_VERSION")"
     args+=(-framework "$framework")
   fi
   simulator_library="$ROOT/prebuilt/ios_sim_arm64/lib${name}.dylib"
   if [ -f "$simulator_library" ]; then
-    framework="$(create_framework "$name" ios_sim_arm64 "$simulator_library" iphonesimulator iPhoneSimulator 15.0)"
+    framework="$(create_framework "$name" ios_sim_arm64 "$simulator_library" iphonesimulator iPhoneSimulator "$IOS_MINIMUM_OS_VERSION")"
     args+=(-framework "$framework")
   fi
   xcodebuild -create-xcframework "${args[@]}" -output "$WORK_DIR/${name}.xcframework"
