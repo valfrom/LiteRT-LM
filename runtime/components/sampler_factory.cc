@@ -510,7 +510,8 @@ class TopKMetalCApiSampler : public TopKCApiSampler {
     // The shared library validation will handle platform checks implicitly,
     // but typically we expect .dylib on Apple.
     auto capi_or = GetSamplerCApi(
-        "libLiteRtTopKMetalSampler.dylib", "LiteRtTopKMetalSampler_Create",
+        "@rpath/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler",
+        "LiteRtTopKMetalSampler_Create",
         "LiteRtTopKMetalSampler_Destroy",
         "LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer",
         "LiteRtTopKMetalSampler_UpdateConfig",
