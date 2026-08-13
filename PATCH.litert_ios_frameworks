@@ -1,0 +1,20 @@
+diff --git a/litert/runtime/accelerators/gpu_registry.cc b/litert/runtime/accelerators/gpu_registry.cc
+index 63ac32e..af22ec8 100644
+--- a/litert/runtime/accelerators/gpu_registry.cc
++++ b/litert/runtime/accelerators/gpu_registry.cc
+@@ -50,6 +50,6 @@ LiteRtStatus RegisterGpuAccelerator(LiteRtEnvironment environment) {
+ #elif TARGET_OS_IPHONE
+ #if LITERT_HAS_METAL_SUPPORT
+-      "libLiteRtMetalAccelerator" SO_EXT,
++      "@rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator",
+ #endif  // LITERT_HAS_METAL_SUPPORT
+ #if LITERT_HAS_WEBGPU_SUPPORT
+       "libLiteRtWebGpuAccelerator" SO_EXT,
+@@ -70,6 +70,6 @@ LiteRtStatus RegisterGpuAccelerator(LiteRtEnvironment environment) {
+       "libLiteRtOpenClAccelerator" SO_EXT,
+ #endif  // LITERT_HAS_OPENCL_SUPPORT
+ #if LITERT_HAS_METAL_SUPPORT
+-      "libLiteRtMetalAccelerator" SO_EXT,
++      "@rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator",
+ #endif  // LITERT_HAS_METAL_SUPPORT
+ #endif  // !__ANDROID__ && !TARGET_OS_IPHONE
