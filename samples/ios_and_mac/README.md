@@ -21,7 +21,7 @@ models natively into iOS and macOS applications using the LiteRT-LM Swift API.
 
 ## Prerequisites
 
-- iOS 15.0 or later
+- iOS 17.0 or later
 - macOS 12.0 or later
 - Xcode 15.0 or later
 - A `.litertlm` model file (e.g., Gemma)

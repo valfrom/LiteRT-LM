@@ -132,7 +132,7 @@ apple_xcframework(
         ],
     },
     minimum_os_versions = {
-        "ios": "15.0",
+        "ios": "17.0",
     },
     public_hdrs = [
         "//c:engine.h",
@@ -200,7 +200,7 @@ ios_unit_test(
     data = [
         "//runtime/testdata",
     ],
-    minimum_os_version = "15.0",
+    minimum_os_version = "17.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
         ":LiteRT_LM_EngineTestsLib",
@@ -212,7 +212,7 @@ ios_unit_test(
     data = [
         "//runtime/testdata",
     ],
-    minimum_os_version = "15.0",
+    minimum_os_version = "17.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
         ":LiteRT_LM_ConversationTestsLib",
@@ -224,7 +224,7 @@ ios_unit_test(
     data = [
         "//runtime/testdata",
     ],
-    minimum_os_version = "15.0",
+    minimum_os_version = "17.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
         ":LiteRT_LM_ToolTestsLib",
@@ -233,7 +233,7 @@ ios_unit_test(
 
 ios_unit_test(
     name = "LiteRT_LM_Message_Tests",
-    minimum_os_version = "15.0",
+    minimum_os_version = "17.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
         ":LiteRT_LM_MessageTestsLib",
@@ -258,7 +258,7 @@ ios_unit_test(
     data = [
         "//runtime/testdata",
     ],
-    minimum_os_version = "15.0",
+    minimum_os_version = "17.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
         ":LiteRT_LM_CapabilitiesTestsLib",
