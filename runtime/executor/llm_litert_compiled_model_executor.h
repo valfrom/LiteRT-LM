@@ -353,6 +353,10 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // Sampler for sampling logits.
   // For now, only CPU sampler is supported.
   std::unique_ptr<Sampler> sampler_;
+  // Serialized sampler parameters last applied to `sampler_`.
+  std::string applied_sampler_params_;
+  // Top-k the sampler was created with; later updates cannot exceed it.
+  int sampler_max_top_k_ = 1;
   bool sampler_handles_input_ = true;
   // Extra input tensors to swap for decode when sampler handles input tensors.
   TensorBuffer decode_prev_input_pos_;

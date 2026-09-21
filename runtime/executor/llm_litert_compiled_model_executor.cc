@@ -1317,6 +1317,8 @@ LlmLiteRtCompiledModelExecutorBase::CloneContext() const {
 absl::Status LlmLiteRtCompiledModelExecutorBase::RestoreContext(
     std::unique_ptr<LlmContext> context_data) {
   llm_context_ = std::move(context_data);
+  // Forces the shared sampler to be reconfigured and reseeded for this context.
+  applied_sampler_params_.clear();
 
   // We can keep our kv cache buffers if this is the first step. This lets us
   // restore from LlmContexts at step 0 with an empty kv cache.
@@ -1350,11 +1352,21 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeSampler(
     output_heads = llm_context_->runtime_config().output_heads.value();
   }
   proto::SamplerParameters sampler_params;
-  sampler_params.set_type(proto::SamplerParameters::TOP_P);
-  sampler_params.set_k(1);
-  sampler_params.set_p(0.0f);
-  sampler_params.set_temperature(1.0f);
-  sampler_params.set_seed(0);
+  if (llm_context_->runtime_config().sampler_params.has_value()) {
+    sampler_params = llm_context_->runtime_config().sampler_params.value();
+  } else {
+    sampler_params.set_type(proto::SamplerParameters::TOP_P);
+    sampler_params.set_k(1);
+    sampler_params.set_p(0.0f);
+    sampler_params.set_temperature(1.0f);
+    sampler_params.set_seed(0);
+  }
+  // The sampler is created with enough top-k capacity for later sessions. The
+  // parameters of the current session are applied before the first sample.
+  constexpr int kMinSamplerTopKCapacity = 40;
+  sampler_max_top_k_ = std::max(sampler_params.k(), kMinSamplerTopKCapacity);
+  sampler_params.set_k(sampler_max_top_k_);
+  applied_sampler_params_.clear();
   ASSIGN_OR_RETURN(
       sampler_,
       CreateSampler(sampler_backend, output_heads, std::move(sampler_params),
@@ -1438,6 +1450,25 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::SampleLogits(
     }
 
     RETURN_IF_ERROR(InitializeSampler(logits_data_type));
+  }
+
+  // The sampler is shared by all sessions, so the parameters of the current
+  // session are applied whenever they differ from the ones in use.
+  if (llm_context_->runtime_config().sampler_params.has_value()) {
+    const proto::SamplerParameters& sampler_params =
+        llm_context_->runtime_config().sampler_params.value();
+    std::string serialized_sampler_params = sampler_params.SerializeAsString();
+    if (serialized_sampler_params != applied_sampler_params_ &&
+        sampler_params.k() <= sampler_max_top_k_) {
+      int output_heads = 1;
+      if (llm_context_->runtime_config().output_heads.has_value()) {
+        output_heads = llm_context_->runtime_config().output_heads.value();
+      }
+      RETURN_IF_ERROR(sampler_->UpdateConfig(
+          sampler_params, output_heads,
+          std::make_shared<std::default_random_engine>(sampler_params.seed())));
+      applied_sampler_params_ = std::move(serialized_sampler_params);
+    }
   }
 
   if (sampler_handles_input_) {
