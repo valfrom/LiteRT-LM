@@ -344,6 +344,16 @@ void litert_lm_session_config_set_apply_prompt_template(
   }
 }
 
+void litert_lm_session_config_set_use_cpu_sampler(LiteRtLmSessionConfig* config,
+                                                  bool use_cpu_sampler) {
+  if (config && config->config) {
+    config->config->SetSamplerBackend(use_cpu_sampler
+                                          ? litert::lm::Backend::CPU
+                                          : litert::lm::Backend::UNSPECIFIED);
+    config->config->SetUseExternalSampler(use_cpu_sampler);
+  }
+}
+
 void litert_lm_session_config_set_sampler_params(
     LiteRtLmSessionConfig* config,
     const LiteRtLmSamplerParams* sampler_params) {

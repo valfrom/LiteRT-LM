@@ -158,6 +158,16 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_session_config_set_apply_prompt_template(
     LiteRtLmSessionConfig* config, bool apply_prompt_template);
 
+// Sets whether sampling runs on the CPU with a sampler owned by the session.
+// A session-owned CPU sampler always honors the sampler parameters of its
+// session config, including the seed. The default executor sampler is created
+// once per engine and is shared by all sessions.
+// @param config The config to modify.
+// @param use_cpu_sampler Whether to sample on the CPU for this session.
+LITERT_LM_C_API_EXPORT
+void litert_lm_session_config_set_use_cpu_sampler(LiteRtLmSessionConfig* config,
+                                                  bool use_cpu_sampler);
+
 // Sets the sampler parameters for this session config.
 // @param config The config to modify.
 // @param sampler_params The sampler parameters to use.
