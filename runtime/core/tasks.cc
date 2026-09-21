@@ -347,7 +347,40 @@ class DecodeOneStep {
       // If constrained decoding is enabled, masks the logits based on the
       // constraint state.
       if (constrained_decoder_) {
-        RETURN_IF_ERROR(constrained_decoder_->MaskLogits(output_logits));
+        LITERT_ASSIGN_OR_RETURN(auto output_logits_buffer_type,
+                                output_logits.BufferType());
+        if (output_logits_buffer_type ==
+            ::litert::TensorBufferType::kHostMemory) {
+          RETURN_IF_ERROR(constrained_decoder_->MaskLogits(output_logits));
+        } else {
+          // Logits produced on an accelerator are copied to the host, masked,
+          // and written back before the external sampler reads them.
+          LITERT_ASSIGN_OR_RETURN(auto logits_tensor_type,
+                                  output_logits.TensorType());
+          if (logits_tensor_type.ElementType() ==
+              ::litert::ElementType::Float32) {
+            LITERT_ASSIGN_OR_RETURN(auto logits_vector,
+                                    CopyFromTensorBuffer<float>(output_logits));
+            RETURN_IF_ERROR(constrained_decoder_->MaskLogits(
+                absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+                logits_tensor_type.Layout().Dimensions()));
+            output_logits.Write(absl::MakeConstSpan(logits_vector.data(),
+                                                    logits_vector.size()));
+          } else if (logits_tensor_type.ElementType() ==
+                     ::litert::ElementType::Float16) {
+            LITERT_ASSIGN_OR_RETURN(
+                auto logits_vector,
+                CopyFromTensorBuffer<tflite::half>(output_logits));
+            RETURN_IF_ERROR(constrained_decoder_->MaskLogits(
+                absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+                logits_tensor_type.Layout().Dimensions()));
+            output_logits.Write(absl::MakeConstSpan(logits_vector.data(),
+                                                    logits_vector.size()));
+          } else {
+            return absl::InvalidArgumentError(
+                "Output logits are not in float32 or float16 type.");
+          }
+        }
       }
 
       // Samping section.
