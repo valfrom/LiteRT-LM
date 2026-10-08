@@ -15,6 +15,7 @@
 #include "runtime/conversation/internal_callback_util.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,9 @@ nlohmann::ordered_json ChannelMessage(absl::string_view text,
   nlohmann::ordered_json message;
   message["role"] = "assistant";
   message["channels"] = {{channel_name, text}};
+  if (channel_name == "thought") {
+    message["reasoning_content"] = text;
+  }
   return message;
 }
 
@@ -163,6 +167,40 @@ TEST_F(InternalCallbackTest, ToolCall) {
                   }
                 ]
               })json")));
+}
+
+TEST_F(InternalCallbackTest, ToolCallStreaming) {
+  auto user_callback = CreateUserMessageCallback(output_, done_, status_);
+  auto callback =
+      CreateInternalCallback(*model_data_processor_, processor_args_, channels_,
+                             std::move(user_callback),
+                             /*cancel_callback=*/nullptr,
+                             /*complete_message_callback=*/nullptr,
+                             /*open_channel_name=*/std::nullopt,
+                             /*return_error_on_max_tokens_reached=*/false,
+                             /*stream_tool_calls=*/true);
+
+  callback(Responses(TaskState::kProcessing, {"```tool_code\n"}));
+  callback(Responses(TaskState::kProcessing, {"tool_name"}));
+  callback(Responses(TaskState::kProcessing, {"(x=1)"}));
+  callback(Responses(TaskState::kProcessing, {"\n```"}));
+
+  EXPECT_THAT(output_, ElementsAre(ChannelMessage("tool_name", "tool_call"),
+                                   ChannelMessage("(x=1)", "tool_call"),
+                                   nlohmann::ordered_json::parse(R"json({
+                              "role": "assistant",
+                              "tool_calls": [
+                                {
+                                  "type": "function",
+                                  "function": {
+                                    "name": "tool_name",
+                                    "arguments": {
+                                      "x": 1
+                                    }
+                                  }
+                                }
+                              ]
+                            })json")));
 }
 
 TEST_F(InternalCallbackTest, TextAndToolCall) {
@@ -724,7 +762,8 @@ TEST_F(InternalCallbackChannelTest, ChannelStreamWithCompleteMessageCallback) {
                 "content": [{"type": "text", "text": "Hello World!"}],
                 "channels": {
                   "thought": "I am thinking"
-                }
+                },
+                "reasoning_content": "I am thinking"
               })json")));
 }
 
@@ -750,6 +789,8 @@ TEST_F(InternalCallbackChannelTest,
   EXPECT_TRUE(final_done);
   EXPECT_TRUE(final_message.contains("channels"));
   EXPECT_EQ(final_message["channels"]["thought"], "I am thinking");
+  EXPECT_TRUE(final_message.contains("reasoning_content"));
+  EXPECT_EQ(final_message["reasoning_content"], "I am thinking");
 }
 
 TEST_F(InternalCallbackChannelTest, OpenChannelAtStartNoEndTag) {
@@ -778,6 +819,89 @@ TEST_F(InternalCallbackChannelTest, OpenChannelAtStartWithEndTag) {
 
   EXPECT_THAT(output_, ElementsAre(ChannelMessage("hmm", "thought"),
                                    TextMessage(" world")));
+}
+
+TEST_F(InternalCallbackChannelTest, CustomReasoningChannelName) {
+  auto user_callback = CreateUserMessageCallback(output_, done_, status_);
+  Message final_message;
+  bool final_done = false;
+  auto complete_message_callback = [&](const Message& message) {
+    final_message = message;
+    final_done = true;
+  };
+
+  std::vector<Channel> reasoning_channels = {
+      {"reasoning", "<|channel>reasoning\n", "<channel|>",
+       /*is_reasoning_channel=*/true}};
+
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, reasoning_channels,
+      std::move(user_callback), /*cancel_callback=*/nullptr,
+      std::move(complete_message_callback));
+
+  callback(Responses(TaskState::kProcessing, {"<|channel>reasoning\n"}));
+  callback(Responses(TaskState::kProcessing, {"I am thinking"}));
+  callback(Responses(TaskState::kDone));
+
+  EXPECT_TRUE(final_done);
+  EXPECT_TRUE(final_message.contains("channels"));
+  EXPECT_EQ(final_message["channels"]["reasoning"], "I am thinking");
+  EXPECT_TRUE(final_message.contains("reasoning_content"));
+  EXPECT_EQ(final_message["reasoning_content"], "I am thinking");
+}
+
+TEST_F(InternalCallbackTest, MaxNumTokensReachedReturnsError) {
+  auto user_callback = CreateUserMessageCallback(output_, done_, status_);
+  bool cancel_called = false;
+  auto cancel_callback = [&]() { cancel_called = true; };
+  bool complete_called = false;
+  auto complete_message_callback = [&](const Message& message) {
+    complete_called = true;
+  };
+
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      std::move(user_callback), std::move(cancel_callback),
+      std::move(complete_message_callback), /*open_channel_name=*/std::nullopt,
+      /*return_error_on_max_tokens_reached=*/true);
+
+  callback(Responses(TaskState::kProcessing, {"Hello"}));
+  callback(Responses(TaskState::kMaxNumTokensReached));
+
+  EXPECT_TRUE(cancel_called);
+  EXPECT_FALSE(complete_called);
+  EXPECT_TRUE(done_);
+  EXPECT_THAT(status_, StatusIs(absl::StatusCode::kResourceExhausted));
+}
+
+TEST_F(InternalCallbackTest, MaxNumTokensReachedTreatedAsDoneWhenFlagIsFalse) {
+  auto user_callback = CreateUserMessageCallback(output_, done_, status_);
+  bool cancel_called = false;
+  auto cancel_callback = [&]() { cancel_called = true; };
+  Message final_message;
+  bool complete_called = false;
+  auto complete_message_callback = [&](const Message& message) {
+    final_message = message;
+    complete_called = true;
+  };
+
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      std::move(user_callback), std::move(cancel_callback),
+      std::move(complete_message_callback), /*open_channel_name=*/std::nullopt,
+      /*return_error_on_max_tokens_reached=*/false);
+
+  callback(Responses(TaskState::kProcessing, {"Hello"}));
+  callback(Responses(TaskState::kMaxNumTokensReached));
+
+  EXPECT_FALSE(cancel_called);
+  EXPECT_TRUE(complete_called);
+  EXPECT_TRUE(done_);
+  EXPECT_OK(status_);
+  EXPECT_THAT(final_message, testing::Eq(Message::parse(R"json({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello"}]
+              })json")));
 }
 
 }  // namespace

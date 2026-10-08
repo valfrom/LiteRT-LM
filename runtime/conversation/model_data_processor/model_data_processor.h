@@ -16,7 +16,6 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_MODEL_DATA_PROCESSOR_MODEL_DATA_PROCESSOR_H_
 
 #include <memory>
-#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -26,26 +25,33 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/constraint.h"
-#include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
+#include "runtime/conversation/model_data_processor/data_utils.h"
 #include "runtime/engine/io_types.h"
+#include "support/preprocessor/audio_preprocessor.h"
+#include "support/preprocessor/audio_preprocessor_miniaudio.h"
+#include "support/preprocessor/image_preprocessor.h"
+#include "support/preprocessor/stb_image_preprocessor.h"
+#include "support/tokenizer/sentencepiece_tokenizer.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
+
+using ::litert::support::AudioPreprocessor;
+using ::litert::support::AudioPreprocessorConfig;
+using ::litert::support::AudioPreprocessorMiniAudio;
+using ::litert::support::ImagePreprocessor;
+using ::litert::support::ImagePreprocessParameter;
+using ::litert::support::SentencePieceTokenizer;
+using ::litert::support::StbImagePreprocessor;
+using ::litert::support::Tokenizer;
+using ::litert::support::TokenizerType;
 
 // ModelDataProcessor is a model-specific component that converts between the
 // generic Json messages and the Litert LM InputData type.
 class ModelDataProcessor {
  public:
-  // The result of rendering a single turn template.
-  struct SingleTurnTemplateRenderResult {
-    // The rendered text.
-    std::string text;
-    // The new state of is_appending_message of Conversation should be updated
-    // to.
-    bool is_appending_message;
-  };
-
   virtual ~ModelDataProcessor() = default;
 
   // Converts a rendered template prompt and a list of messages to a vector of
@@ -69,37 +75,25 @@ class ModelDataProcessor {
   // For example, messages represent tool calls as a list of JSON objects, but a
   // model's Jinja template may expect the tool calls to already be formatted
   // in a particular tool calling syntax.
-  virtual absl::StatusOr<nlohmann::ordered_json> MessageToTemplateInput(
-      const nlohmann::ordered_json& message) const = 0;
-
-  // Renders a single turn template for the given message and history. Only the
-  // prompt template supporting single turn is valid for this method.
-  //  - history: The history of the conversation.
-  //  - preface: The preface of the conversation.
-  //  - message: The current message to be rendered.
-  //  - prompt_template: The prompt template to use for rendering.
-  //  - current_is_appending_message: Whether the current conversation is in
-  //  appending state.
-  //  - append_message: Whether the current message is for appending.
-  //  - extra_context: Optional context to merge into the PromptTemplateInput
-  //  for prompt template rendering.
   //
-  // Returns the rendered text and the new is_appending_message as a
-  // SingleTurnTemplateRenderResult.
-  virtual absl::StatusOr<SingleTurnTemplateRenderResult>
-  RenderSingleTurnTemplate(
-      std::vector<Message>& history, const Preface& preface,
-      const Message& message, const PromptTemplate& prompt_template,
-      bool current_is_appending_message, bool append_message,
-      std::optional<nlohmann::ordered_json> extra_context) const {
-    return absl::UnimplementedError(
-        "RenderSingleTurnTemplate is not implemented.");
+  // By default, this normalizes the message content to a list of multimodal
+  // parts using NormalizeMessageContent. Models that require specific tool
+  // syntax formatting (e.g. Gemma 3, Function Gemma) can override this method.
+  virtual absl::StatusOr<nlohmann::ordered_json> MessageToTemplateInput(
+      const nlohmann::ordered_json& message) const {
+    return NormalizeMessageContent(message);
   }
+
+  // Returns whether a dummy empty user message should be appended to the
+  // preface when rendering single-turn templates. Used for Gemma 3 templates.
+  virtual bool PushDummyUserMessageToPreface() const { return false; }
 
   // Formats the provided tools to be inserted into the system/developer
   // instruction of the prompt.
   virtual absl::StatusOr<nlohmann::ordered_json> FormatTools(
-      const nlohmann::ordered_json& tools) const = 0;
+      const nlohmann::ordered_json& tools) const {
+    return tools;
+  }
 
   // Creates a constraint from the given tools. The constraint is used for
   // constrained decoding. It is created from the tools defined in the preface,
@@ -110,10 +104,10 @@ class ModelDataProcessor {
   };
 
   // Returns the start of tool call blocks.
-  virtual absl::string_view CodeFenceStart() const = 0;
+  virtual absl::string_view CodeFenceStart() const { return ""; }
 
   // Returns the end of tool call blocks.
-  virtual absl::string_view CodeFenceEnd() const = 0;
+  virtual absl::string_view CodeFenceEnd() const { return ""; }
 
   // Clones the state of the other model data processor.
   virtual absl::Status CloneState(const ModelDataProcessor& other) = 0;
@@ -192,14 +186,26 @@ class TypeSafeModelDataProcessor : public ModelDataProcessor {
   virtual absl::StatusOr<std::vector<InputData>> ToInputDataVectorImpl(
       const std::string& rendered_template_prompt,
       const nlohmann::ordered_json& messages,
-      const ExpectedArgsT& typed_args) const = 0;
+      const ExpectedArgsT& typed_args) const {
+    std::vector<InputData> input_data;
+    input_data.emplace_back(InputText(rendered_template_prompt));
+    return input_data;
+  }
 
   virtual absl::StatusOr<Message> ToMessageImpl(
-      const Responses& responses, const ExpectedArgsT& typed_args) const = 0;
+      const Responses& responses, const ExpectedArgsT& typed_args) const {
+    absl::string_view response_text = responses.GetTexts()[0];
+    return nlohmann::ordered_json::object(
+        {{"role", "assistant"},
+         {"content",
+          nlohmann::ordered_json::array(
+              {{{"type", "text"}, {"text", std::string(response_text)}}})}});
+  }
 
   virtual absl::Status CloneStateImpl(
-      const TypeSafeModelDataProcessor<ExpectedConfigT, ExpectedArgsT>&
-          other) = 0;
+      const TypeSafeModelDataProcessor<ExpectedConfigT, ExpectedArgsT>& other) {
+    return absl::OkStatus();
+  }
 };
 
 }  // namespace litert::lm

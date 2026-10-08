@@ -15,34 +15,65 @@ enum FixError: Error {
 
 func fixGTMLoggerClasses(at path: String) throws {
   let url = URL(fileURLWithPath: path)
-  let source = Data("GTMLog".utf8)
-  let replacement = Data("LRtLog".utf8)
+  let prefixes: [String: (String, String, String)] = [
+    "CLiteRTLM": ("LRtLog", "LCG", "LCS"),
+    "GemmaModelConstraintProvider": ("LGcLog", "LGG", "LGS"),
+    "LiteRt": ("LCoLog", "LRG", "LRS"),
+    "LiteRtMetalAccelerator": ("LMaLog", "LMG", "LMS"),
+    "LiteRtTopKMetalSampler": ("LSaLog", "LSG", "LSS"),
+  ]
+  guard let prefix = prefixes[url.lastPathComponent] else {
+    throw FixError.replacementFailed(path)
+  }
+  let output = Pipe()
+  let inspection = Process()
+  inspection.executableURL = URL(fileURLWithPath: "/usr/bin/otool")
+  inspection.arguments = ["-ov", path]
+  inspection.standardOutput = output
+  try inspection.run()
+  let listing = output.fileHandleForReading.readDataToEndOfFile()
+  inspection.waitUntilExit()
+  guard inspection.terminationStatus == 0,
+    let text = String(data: listing, encoding: .utf8)
+  else {
+    throw FixError.replacementFailed(path)
+  }
+  let expression = try NSRegularExpression(
+    pattern: #"\bname\s+0x[0-9a-fA-F]+\s+((?:GTMLog|GIP|SRL|GSC)[A-Za-z0-9_]+)"#)
+  let names = Set(expression.matches(in: text, range: NSRange(text.startIndex..., in: text))
+    .compactMap { Range($0.range(at: 1), in: text).map { String(text[$0]) } })
+  let replacements = names.sorted { $0.count > $1.count }.map { name in
+    var renamed = name.replacingOccurrences(of: "GTMLog", with: prefix.0)
+    for (old, new) in [("GIP", prefix.1), ("SRL", prefix.2), ("GSC", String(prefix.1.prefix(2)) + "X")] {
+      if renamed.hasPrefix(old) {
+        renamed.replaceSubrange(renamed.startIndex..<renamed.index(renamed.startIndex, offsetBy: old.count), with: new)
+      }
+    }
+    return (name, renamed)
+  }
   var data = try Data(contentsOf: url)
-  var searchStart = data.startIndex
   var replacementCount = 0
 
-  while searchStart < data.endIndex,
-    let range = data.range(of: source, options: [], in: searchStart..<data.endIndex)
-  {
-    data.replaceSubrange(range, with: replacement)
-    searchStart = range.upperBound
-    replacementCount += 1
-  }
-
-  if data.range(of: source) != nil {
-    throw FixError.replacementFailed(path)
+  for (old, new) in replacements {
+    let source = Data(old.utf8)
+    let replacement = Data(new.utf8)
+    var searchStart = data.startIndex
+    while searchStart < data.endIndex,
+      let range = data.range(of: source, options: [], in: searchStart..<data.endIndex)
+    {
+      data.replaceSubrange(range, with: replacement)
+      searchStart = range.upperBound
+      replacementCount += 1
+    }
+    if data.range(of: source) != nil {
+      throw FixError.replacementFailed(path)
+    }
   }
 
   if replacementCount > 0 {
     try data.write(to: url)
   }
-
-  let output = try Data(contentsOf: url)
-  if output.range(of: source) != nil {
-    throw FixError.replacementFailed(path)
-  }
-
-  print("Renamed \(replacementCount) GTMLogger occurrences in \(path)")
+  print("Renamed \(replacementCount) embedded class occurrences in \(path)")
 }
 
 do {

@@ -25,14 +25,31 @@ cc_library(
     name = "bitmap",
     hdrs = ["bitmap.h"],
     visibility = ["//visibility:public"],
+    deps = ["@com_google_absl//absl/base:core_headers"],
+)
+
+cc_library(
+    name = "logit_mask",
+    srcs = ["logit_mask.cc"],
+    hdrs = ["logit_mask.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "@litert//tflite/types:half",
+    ],
 )
 
 cc_library(
     name = "constraint",
+    srcs = ["constraint.cc"],
     hdrs = ["constraint.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":bitmap",
+        ":logit_mask",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
     ],
 )
@@ -76,6 +93,52 @@ cc_library(
 )
 
 cc_library(
+    name = "no_repeat_ngram_config",
+    hdrs = ["no_repeat_ngram_config.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "no_repeat_ngram_config_test",
+    srcs = ["no_repeat_ngram_config_test.cc"],
+    deps = [
+        ":no_repeat_ngram_config",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "repetition_penalty_config",
+    hdrs = ["repetition_penalty_config.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "repetition_penalty_config_test",
+    srcs = ["repetition_penalty_config_test.cc"],
+    deps = [
+        ":repetition_penalty_config",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "suppress_tokens_config",
+    hdrs = ["suppress_tokens_config.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@com_google_absl//absl/container:flat_hash_set"],
+)
+
+cc_test(
+    name = "suppress_tokens_config_test",
+    srcs = ["suppress_tokens_config_test.cc"],
+    deps = [
+        ":suppress_tokens_config",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "constrained_decoder",
     srcs = ["constrained_decoder.cc"],
     hdrs = ["constrained_decoder.h"],
@@ -85,22 +148,17 @@ cc_library(
     deps = [
         ":constraint",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/types:span",
         "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_layout",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//litert/cc:litert_tensor_buffer_types",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
         "@litert//tflite/types:half",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_layout",
-            "@litert//litert/cc:litert_macros",
-            "@litert//litert/cc:litert_model",
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_library(
@@ -110,6 +168,7 @@ cc_library(
     deps = [
         ":bitmap",
         ":constraint",
+        ":logit_mask",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
     ],
@@ -189,10 +248,12 @@ cc_library(
     deps = [
         ":bitmap",
         ":constraint",
+        ":logit_mask",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
         "@crate_index__llguidance-1.3.0//:llguidance_cc"
     ] + select({
         "@platforms//os:windows": [
@@ -221,7 +282,8 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
-        "//runtime/components:tokenizer",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "//support/tokenizer",
         "@crate_index__llguidance-1.3.0//:llguidance_cc"
     ] + select({
         "@platforms//os:windows": [
@@ -230,6 +292,25 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+)
+
+cc_library(
+    name = "tool_utils",
+    srcs = ["tool_utils.cc"],
+    hdrs = ["tool_utils.h"],
+    deps = [
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "tool_utils_test",
+    srcs = ["tool_utils_test.cc"],
+    deps = [
+        ":tool_utils",
+        "@com_google_googletest//:gtest_main",
+        "@nlohmann_json//:json",
+    ],
 )
 
 cc_library(
@@ -247,12 +328,12 @@ cc_library(
         "llguidance_schema_utils.h",
     ],
     deps = [
+        ":tool_utils",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/strings:string_view",
         "@nlohmann_json//:json",
     ],
 )
@@ -269,13 +350,15 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@nlohmann_json//:json",
-        "//runtime/components:tokenizer",
         "//runtime/util:litert_status_util",
         "//runtime/util:test_utils",
+        "//support/tokenizer",
     ],
 )
 
@@ -286,28 +369,6 @@ cc_test(
         ":llguidance_schema_utils",
         "@com_google_googletest//:gtest_main",
         "@nlohmann_json//:json",
-    ],
-)
-
-cc_test(
-    name = "llg_fc_tool_calls_test",
-    srcs = ["llg_fc_tool_calls_test.cc"],
-    deps = [
-        ":bitmap",
-        ":constraint",
-        ":llg_constraint_config",
-        ":llg_constraint_provider",
-        ":llguidance_schema_utils",
-        "@com_google_googletest//:gtest_main",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@nlohmann_json//:json",
-        "//runtime/components:tokenizer",
-        "//runtime/util:litert_status_util",
-        "//runtime/util:test_utils",
     ],
 )
 
@@ -323,13 +384,14 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@nlohmann_json//:json",
-        "//runtime/components:tokenizer",
         "//runtime/util:litert_status_util",
-        "//runtime/util:test_utils",
+        "//support/tokenizer",
     ],
 )
 
@@ -343,7 +405,8 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
-        "//runtime/components:tokenizer",
+        "@com_google_absl//absl/types:span",
+        "//support/tokenizer",
         "//runtime/util:test_utils",
         "@crate_index__llguidance-1.3.0//:llguidance_cc"
     ],
@@ -358,11 +421,13 @@ cc_test(
         ":constraint_provider",
         ":llg_constraint_config",
         ":llg_constraint_provider",
+        ":logit_mask",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "//runtime/components:tokenizer",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:test_utils",
+        "//support/tokenizer",
     ],
 )
 
@@ -396,7 +461,7 @@ cc_library(
         ":llg_constraint_provider",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "//runtime/components:tokenizer",
+        "//support/tokenizer",
     ],
 )
 
@@ -412,7 +477,207 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
-        "//runtime/components:tokenizer",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:test_utils",
+        "//support/tokenizer",
+    ],
+)
+
+cc_library(
+    name = "thinking_budget_constraint",
+    srcs = ["thinking_budget_constraint.cc"],
+    hdrs = ["thinking_budget_constraint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":logit_mask",
+        "@com_google_absl//absl/status:statusor",
+        "//runtime/util:litert_status_util",
+    ],
+)
+
+cc_test(
+    name = "thinking_budget_constraint_test",
+    srcs = ["thinking_budget_constraint_test.cc"],
+    deps = [
+        ":bitmap",
+        ":fake_constraint",
+        ":logit_mask",
+        ":thinking_budget_constraint",
+        "@com_google_googletest//:gtest_main",
+        "//runtime/util:test_utils",
+    ],
+)
+
+cc_test(
+    name = "constraint_test",
+    srcs = ["constraint_test.cc"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":logit_mask",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "//runtime/util:test_utils",
+    ],
+)
+
+cc_test(
+    name = "logit_mask_test",
+    srcs = ["logit_mask_test.cc"],
+    deps = [
+        ":logit_mask",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "suppress_tokens_constraint",
+    srcs = ["suppress_tokens_constraint.cc"],
+    hdrs = ["suppress_tokens_constraint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":constraint",
+        ":logit_mask",
+        ":suppress_tokens_config",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "suppress_tokens_constraint_test",
+    srcs = ["suppress_tokens_constraint_test.cc"],
+    deps = [
+        ":logit_mask",
+        ":suppress_tokens_config",
+        ":suppress_tokens_constraint",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "no_repeat_ngram_constraint",
+    srcs = ["no_repeat_ngram_constraint.cc"],
+    hdrs = ["no_repeat_ngram_constraint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":constraint",
+        ":logit_mask",
+        ":no_repeat_ngram_config",
+        "@com_google_absl//absl/container:fixed_array",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "no_repeat_ngram_constraint_test",
+    srcs = ["no_repeat_ngram_constraint_test.cc"],
+    deps = [
+        ":logit_mask",
+        ":no_repeat_ngram_config",
+        ":no_repeat_ngram_constraint",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "repetition_penalty_constraint",
+    srcs = ["repetition_penalty_constraint.cc"],
+    hdrs = ["repetition_penalty_constraint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":constraint",
+        ":logit_mask",
+        ":repetition_penalty_config",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_test(
+    name = "repetition_penalty_constraint_test",
+    srcs = ["repetition_penalty_constraint_test.cc"],
+    deps = [
+        ":logit_mask",
+        ":repetition_penalty_config",
+        ":repetition_penalty_constraint",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "composite_constraint",
+    srcs = ["composite_constraint.cc"],
+    hdrs = ["composite_constraint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":logit_mask",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "composite_constraint_test",
+    srcs = ["composite_constraint_test.cc"],
+    deps = [
+        ":bitmap",
+        ":composite_constraint",
+        ":constraint",
+        ":constraint_provider",
+        ":fake_constraint",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":logit_mask",
+        ":no_repeat_ngram_config",
+        ":no_repeat_ngram_constraint",
+        ":repetition_penalty_config",
+        ":repetition_penalty_constraint",
+        ":suppress_tokens_config",
+        ":suppress_tokens_constraint",
+        ":thinking_budget_constraint",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "@litert//tflite/types:half",
     ],
 )

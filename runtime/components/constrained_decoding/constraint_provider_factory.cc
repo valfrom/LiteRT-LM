@@ -26,7 +26,6 @@
 #include "runtime/components/constrained_decoding/external_constraint_provider.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
-#include "runtime/components/tokenizer.h"
 
 namespace litert::lm {
 

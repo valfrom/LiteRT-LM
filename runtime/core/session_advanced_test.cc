@@ -26,25 +26,32 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
+#include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_join.h"  // from @com_google_absl
 #include "absl/strings/str_replace.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/test/matchers.h"  // from @litert
 #include "runtime/components/constrained_decoding/fake_constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
+#include "runtime/core/session_utils.h"
+#include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/framework/resource_management/execution_manager.h"
@@ -53,14 +60,22 @@
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
+#include "support/tokenizer/sentencepiece_tokenizer.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
+
+using SentencePieceTokenizer = ::litert::support::SentencePieceTokenizer;
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+
 namespace {
 
 using ::testing::status::StatusIs;
 
 constexpr absl::string_view kTestdataDir =
     "litert_lm/runtime/components/testdata/";
+
 constexpr absl::string_view kTestAudioModelPath =
     "litert_lm/runtime/testdata/dummy_audio_only.litertlm";
 
@@ -87,22 +102,12 @@ constexpr std::array<float,
         1., 0., 0., 1., 0., 1., 0., 1., 1., 0., 0., 1., 0., 1., 0., 0.,
         0., 1., 0., 1., 1., 0., 1., 0., 0., 0., 1., 0., 1., 1., 1., 1.};
 
-absl::StatusOr<std::unique_ptr<FakeLlmExecutor>> CreateFakeLlmExecutor(
-    std::vector<std::vector<int>> prefill_tokens,
-    std::vector<std::vector<int>> decode_tokens,
-    std::optional<std::vector<float>> audio_embedding = std::nullopt) {
-  auto batch_size = decode_tokens.empty() ? 1 : decode_tokens[0].size();
-  auto fake_executor = std::make_unique<FakeLlmExecutor>(
-      2560, prefill_tokens, decode_tokens, batch_size, audio_embedding);
-  return std::move(fake_executor);
-}
-
 class ExtendedTokenizer : public Tokenizer {
  public:
   static absl::StatusOr<std::unique_ptr<ExtendedTokenizer>> CreateFromFile(
       absl::string_view model_path) {
-    ASSIGN_OR_RETURN(auto tokenizer,
-                     SentencePieceTokenizer::CreateFromFile(model_path));
+    ABSL_ASSIGN_OR_RETURN(auto tokenizer,
+                          SentencePieceTokenizer::CreateFromFile(model_path));
     return absl::WrapUnique(new ExtendedTokenizer(std::move(tokenizer)));
   }
 
@@ -122,7 +127,7 @@ class ExtendedTokenizer : public Tokenizer {
         auto extended_token_pos = text.find(extended_token_str);
         if (extended_token_pos != std::string::npos) {
           // The text before the extended token.
-          ASSIGN_OR_RETURN(
+          ABSL_ASSIGN_OR_RETURN(
               auto text_ids,
               tokenizer_->TextToTokenIds(text.substr(0, extended_token_pos)));
           token_ids.insert(token_ids.end(), text_ids.begin(), text_ids.end());
@@ -133,21 +138,21 @@ class ExtendedTokenizer : public Tokenizer {
       }
     } while (is_extended_token_found);
     if (!text.empty()) {
-      ASSIGN_OR_RETURN(auto text_ids, tokenizer_->TextToTokenIds(text));
+      ABSL_ASSIGN_OR_RETURN(auto text_ids, tokenizer_->TextToTokenIds(text));
       token_ids.insert(token_ids.end(), text_ids.begin(), text_ids.end());
     }
     return token_ids;
   }
 
   absl::StatusOr<std::string> TokenIdsToText(
-      const std::vector<int>& token_ids) override {
+      absl::Span<const int> token_ids, bool skip_special_tokens) override {
     std::vector<std::string> token_strs;
     std::vector<int> current_standard_tokens;
     for (int token_id : token_ids) {
       if (id_to_extended_tokens_.contains(token_id)) {
         if (!current_standard_tokens.empty()) {
-          ASSIGN_OR_RETURN(auto std_text,
-                           tokenizer_->TokenIdsToText(current_standard_tokens));
+          ABSL_ASSIGN_OR_RETURN(auto std_text, tokenizer_->TokenIdsToText(
+                                                   current_standard_tokens));
           token_strs.push_back(std_text);
           current_standard_tokens.clear();
         }
@@ -157,8 +162,8 @@ class ExtendedTokenizer : public Tokenizer {
       }
     }
     if (!current_standard_tokens.empty()) {
-      ASSIGN_OR_RETURN(auto std_text,
-                       tokenizer_->TokenIdsToText(current_standard_tokens));
+      ABSL_ASSIGN_OR_RETURN(
+          auto std_text, tokenizer_->TokenIdsToText(current_standard_tokens));
       token_strs.push_back(std_text);
     }
     return absl::StrReplaceAll(absl::StrJoin(token_strs, ""), {{"▁", " "}});
@@ -178,6 +183,8 @@ class ExtendedTokenizer : public Tokenizer {
   std::vector<std::string> GetTokens() const override {
     return tokenizer_->GetTokens();
   }
+
+  int GetVocabSize() const override { return tokenizer_->GetVocabSize(); }
 
  private:
   explicit ExtendedTokenizer(std::unique_ptr<SentencePieceTokenizer> tokenizer)
@@ -200,9 +207,21 @@ class SessionAdvancedTest : public testing::Test {
     tokenizer_ = std::move(*tokenizer);
     model_resources_ = std::unique_ptr<ModelResources>();
     sampler_params_.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
+    fake_executor_ = nullptr;
   }
 
-  absl::StatusOr<std::unique_ptr<SessionAdvanced>> CreateTestSession() {
+  std::unique_ptr<FakeLlmExecutor> CreateFakeLlmExecutor(
+      std::vector<std::vector<int>> prefill_tokens,
+      std::vector<std::vector<int>> decode_tokens,
+      std::optional<std::vector<float>> audio_embedding = std::nullopt) {
+    auto batch_size = decode_tokens.empty() ? 1 : decode_tokens[0].size();
+    return std::make_unique<FakeLlmExecutor>(tokenizer_->GetVocabSize(),
+                                             prefill_tokens, decode_tokens,
+                                             batch_size, audio_embedding);
+  }
+
+  absl::StatusOr<std::unique_ptr<SessionAdvanced>> CreateTestSession(
+      const Engine* engine = nullptr) {
     const std::vector<std::vector<int>> stop_token_ids = {{2294}};
     SessionConfig session_config = SessionConfig::CreateDefault();
     session_config.GetMutableSamplerParams() = sampler_params_;
@@ -210,15 +229,14 @@ class SessionAdvancedTest : public testing::Test {
     session_config.SetStartTokenId(2);
     session_config.SetSamplerBackend(Backend::CPU);
 
-    ASSIGN_OR_RETURN(
-        auto executor,
-        CreateFakeLlmExecutor(
-            // "Hello World!"
-            /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-            // "How's it going?"
-            /*decode_tokens=*/{
-                {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
-    ASSIGN_OR_RETURN(
+    auto executor = CreateFakeLlmExecutor(
+        // "Hello World!"
+        /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+        // "How's it going?"
+        /*decode_tokens=*/{
+            {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
+    fake_executor_ = executor.get();
+    ABSL_ASSIGN_OR_RETURN(
         execution_manager_,
         ThreadedExecutionManager::Create(
             tokenizer_.get(), model_resources_.get(), std::move(executor),
@@ -228,25 +246,28 @@ class SessionAdvancedTest : public testing::Test {
 
     return SessionAdvanced::Create(execution_manager_, tokenizer_.get(),
                                    session_config,
-                                   /*benchmark_info=*/std::nullopt);
+                                   /*benchmark_info=*/std::nullopt,
+                                   /*living_sessions_count=*/nullptr, engine);
   }
 
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<ModelResources> model_resources_;
   proto::SamplerParameters sampler_params_;
   std::shared_ptr<ExecutionManager> execution_manager_;
+  FakeLlmExecutor* fake_executor_ = nullptr;
 };
 
 absl::StatusOr<std::unique_ptr<AudioExecutorSettings>>
 CreateAudioExecutorSettings(const std::string& model_path,
                             int max_sequence_length, Backend backend) {
-  ASSIGN_OR_RETURN(auto model_file, ScopedFile::Open(model_path));
+  ABSL_ASSIGN_OR_RETURN(auto model_file, ScopedFile::Open(model_path));
   auto model_file_ptr = std::make_shared<ScopedFile>(std::move(model_file));
-  ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(model_file_ptr));
+  ABSL_ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(model_file_ptr));
   // Create the audio executor settings.
-  ASSIGN_OR_RETURN(auto audio_executor_settings,
-                   AudioExecutorSettings::CreateDefault(
-                       model_assets, max_sequence_length, backend));
+  ABSL_ASSIGN_OR_RETURN(
+      auto audio_executor_settings,
+      AudioExecutorSettings::CreateDefault(model_assets, max_sequence_length,
+                                           backend, backend));
   return std::make_unique<AudioExecutorSettings>(
       std::move(audio_executor_settings));
 }
@@ -281,19 +302,16 @@ TEST_F(SessionAdvancedTest, RunPrefill) {
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // The prefill tokens are the expected tokens that will be passed in
-          // at each time the Prefill function is called. The values are the
-          // token ids of the input prompt "Hello World!".
-          // The decode tokens are the expected tokens that will be returned
-          // by the Decode function. The values are the token ids of the
-          // output response "How's it going?" followed by the stop token id
-          // (2294).
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // The prefill tokens are the expected tokens that will be passed in
+      // at each time the Prefill function is called. The values are the
+      // token ids of the input prompt "Hello World!".
+      // The decode tokens are the expected tokens that will be returned
+      // by the Decode function. The values are the token ids of the
+      // output response "How's it going?" followed by the stop token id
+      // (2294).
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -314,9 +332,9 @@ TEST_F(SessionAdvancedTest, RunPrefill) {
 TEST_F(SessionAdvancedTest, EmptyInputTextReturnsError) {
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(auto executor, CreateFakeLlmExecutor(
-                                          /*prefill_tokens=*/{{}},
-                                          /*decode_tokens=*/{{}}));
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{}},
+      /*decode_tokens=*/{{}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -341,14 +359,11 @@ TEST_F(SessionAdvancedTest, RunDecodeWithInternalSampler) {
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -369,7 +384,7 @@ TEST_F(SessionAdvancedTest, RunDecodeWithInternalSampler) {
   EXPECT_EQ(responses.GetTexts().size(), 1);
   // The response is " How's it going?" since "!" is the stop token which is
   // not included in the response.
-  EXPECT_EQ(responses.GetTexts()[0], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[0], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[0],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids,
@@ -383,14 +398,11 @@ TEST_F(SessionAdvancedTest, RunDecodeWithMaxOutputTokens) {
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -412,7 +424,7 @@ TEST_F(SessionAdvancedTest, RunDecodeWithMaxOutputTokens) {
   ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
   // Expect a single output candidate.
   EXPECT_EQ(responses.GetTexts().size(), 1);
-  EXPECT_EQ(responses.GetTexts()[0], " How'");
+  EXPECT_EQ(responses.GetTexts()[0], "How'");
   EXPECT_THAT(responses.GetTokenIds()[0], testing::ElementsAre(224, 24));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids,
                        tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
@@ -427,14 +439,11 @@ TEST_F(SessionAdvancedTest, RunDecodeWithExternalSampler) {
   session_config.SetStartTokenId(2);
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -455,7 +464,7 @@ TEST_F(SessionAdvancedTest, RunDecodeWithExternalSampler) {
   EXPECT_EQ(responses.GetTexts().size(), 1);
   // The response is " How's it going?" since "!" is the stop token which is
   // not included in the response.
-  EXPECT_EQ(responses.GetTexts()[0], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[0], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[0],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids,
@@ -471,20 +480,18 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
   session_config.SetNumOutputCandidates(3);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?", "Hello World", "How's it going?"
-          /*decode_tokens=*/{{224, 90, 224},
-                             {24, 547, 24},
-                             {8, 58, 8},
-                             {66, 735, 66},
-                             {246, 210, 246},
-                             {18, 466, 18},
-                             {2295, 2294, 2295},
-                             {2294, 0, 2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?", "Hello World", "How's it going?"
+      /*decode_tokens=*/{{224, 90, 224},
+                         {24, 547, 24},
+                         {8, 58, 8},
+                         {66, 735, 66},
+                         {246, 210, 246},
+                         {18, 466, 18},
+                         {2295, 2294, 2295},
+                         {2294, 0, 2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -504,19 +511,19 @@ TEST_F(SessionAdvancedTest,
   EXPECT_EQ(responses.GetTexts().size(), 3);
   // The response is " How's it going?" since "!" is the stop token which is
   // not included in the response.
-  EXPECT_EQ(responses.GetTexts()[0], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[0], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[0],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids0,
                        tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
   EXPECT_EQ(text_from_ids0, responses.GetTexts()[0]);
-  EXPECT_EQ(responses.GetTexts()[1], " Hello World");
+  EXPECT_EQ(responses.GetTexts()[1], "Hello World");
   EXPECT_THAT(responses.GetTokenIds()[1],
               testing::ElementsAre(90, 547, 58, 735, 210, 466));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids1,
                        tokenizer_->TokenIdsToText(responses.GetTokenIds()[1]));
   EXPECT_EQ(text_from_ids1, responses.GetTexts()[1]);
-  EXPECT_EQ(responses.GetTexts()[2], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[2], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[2],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids2,
@@ -534,20 +541,18 @@ TEST_F(SessionAdvancedTest,
   session_config.SetNumOutputCandidates(3);
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?", "Hello World", "How's it going?"
-          /*decode_tokens=*/{{224, 90, 224},
-                             {24, 547, 24},
-                             {8, 58, 8},
-                             {66, 735, 66},
-                             {246, 210, 246},
-                             {18, 466, 18},
-                             {2295, 2294, 2295},
-                             {2294, 0, 2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?", "Hello World", "How's it going?"
+      /*decode_tokens=*/{{224, 90, 224},
+                         {24, 547, 24},
+                         {8, 58, 8},
+                         {66, 735, 66},
+                         {246, 210, 246},
+                         {18, 466, 18},
+                         {2295, 2294, 2295},
+                         {2294, 0, 2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -567,19 +572,19 @@ TEST_F(SessionAdvancedTest,
   EXPECT_EQ(responses.GetTexts().size(), 3);
   // The response is " How's it going?" since "!" is the stop token which is
   // not included in the response.
-  EXPECT_EQ(responses.GetTexts()[0], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[0], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[0],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids0,
                        tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
   EXPECT_EQ(text_from_ids0, responses.GetTexts()[0]);
-  EXPECT_EQ(responses.GetTexts()[1], " Hello World");
+  EXPECT_EQ(responses.GetTexts()[1], "Hello World");
   EXPECT_THAT(responses.GetTokenIds()[1],
               testing::ElementsAre(90, 547, 58, 735, 210, 466));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids1,
                        tokenizer_->TokenIdsToText(responses.GetTokenIds()[1]));
   EXPECT_EQ(text_from_ids1, responses.GetTexts()[1]);
-  EXPECT_EQ(responses.GetTexts()[2], " How's it going?");
+  EXPECT_EQ(responses.GetTexts()[2], "How's it going?");
   EXPECT_THAT(responses.GetTokenIds()[2],
               testing::ElementsAre(224, 24, 8, 66, 246, 18, 2295));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids2,
@@ -592,7 +597,7 @@ TEST_F(SessionAdvancedTest,
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -606,16 +611,14 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutableSamplerParams() = sampler_params;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -649,7 +652,7 @@ TEST_F(SessionAdvancedTest,
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -665,16 +668,14 @@ TEST_F(SessionAdvancedTest,
   session_config.SetStartTokenId(2);
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -719,14 +720,11 @@ TEST_F(SessionAdvancedTest, RunPrefillAsync) {
   session_config.SetStartTokenId(2);
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -750,20 +748,100 @@ TEST_F(SessionAdvancedTest, RunPrefillAsync) {
   EXPECT_TRUE(done);
 }
 
+TEST_F(SessionAdvancedTest, PrefillPreprocessedContentsSuccess) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.SetStartTokenId(2);
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetSamplerBackend(Backend::CPU);
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+
+  std::optional<BenchmarkInfo> benchmark_info;
+  ASSERT_OK_AND_ASSIGN(
+      auto preprocessed_contents,
+      PreprocessContents(inputs, session_config, *tokenizer_, benchmark_info));
+
+  bool done = false;
+  auto callback = CreateTestCallback(done);
+  EXPECT_OK(session->PrefillPreprocessedContents(
+      std::move(preprocessed_contents), std::move(callback)));
+  // Wait for the async call to finish.
+  EXPECT_OK(execution_manager->WaitUntilAllDone(absl::Seconds(100)));
+  EXPECT_TRUE(done);
+}
+
+TEST_F(SessionAdvancedTest,
+       PrefillPreprocessedContentsExecutionManagerUnavailable) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.SetStartTokenId(2);
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetSamplerBackend(Backend::CPU);
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+
+  std::optional<BenchmarkInfo> benchmark_info;
+  ASSERT_OK_AND_ASSIGN(
+      auto preprocessed_contents,
+      PreprocessContents(inputs, session_config, *tokenizer_, benchmark_info));
+
+  execution_manager.reset();
+
+  auto callback = [](absl::StatusOr<Responses> responses) {};
+  EXPECT_THAT(session->PrefillPreprocessedContents(
+                  std::move(preprocessed_contents), std::move(callback)),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "Execution manager is not available."));
+}
+
 TEST_F(SessionAdvancedTest, RunDecodeAsyncWithInternalSampler) {
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.SetStartTokenId(2);
   session_config.GetMutableStopTokenIds() = stop_token_ids;
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -796,14 +874,11 @@ TEST_F(SessionAdvancedTest, RunDecodeAsyncWithExternalSampler) {
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -828,12 +903,200 @@ TEST_F(SessionAdvancedTest, RunDecodeAsyncWithExternalSampler) {
   EXPECT_TRUE(done_decode);
 }
 
+TEST_F(SessionAdvancedTest, RunDecodeWithRepetitionPenaltyConfig) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it go go go"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {246}, {246}, {2294}});
+  executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 2294,
+                                           .mismatch_end_token_value = 0.0f});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  // Create a config with penalties strong enough to suppress the repetition.
+  RepetitionPenaltyConfig config(/*repetition_penalty=*/2.0f,
+                                 /*presence_penalty=*/10.0f,
+                                 /*frequency_penalty=*/1.0f,
+                                 /*window_size=*/5);
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetRepetitionPenaltyConfig(std::move(config));
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
+  // Expect the output to be " How's it go" instead of " How's it go go go"
+  // because the repetition penalty is applied.
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How's it go");
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids,
+                       tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids, responses.GetTexts()[0]);
+}
+
+TEST_F(SessionAdvancedTest, RunDecodeWithNoRepeatNgramConfig) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going going"
+      /*decode_tokens=*/{
+          {224}, {24}, {8}, {66}, {246}, {18}, {246}, {18}, {2294}});
+  executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 2294,
+                                           .mismatch_end_token_value = 0.0f});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  // Create a config with penalties strong enough to suppress the repetition.
+  NoRepeatNgramConfig config(/*no_repeat_ngram_size=*/2, /*window_size=*/5);
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetNoRepeatNgramConfig(std::move(config));
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
+  // Expect the output to be " How's it going go" instead of " How's it going
+  // going" because the second "going" is banned.
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How's it going go");
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids,
+                       tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids, responses.GetTexts()[0]);
+}
+
+TEST_F(SessionAdvancedTest, RunDecodeWithSuppressTokensConfig) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it go go go"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {246}, {246}, {2294}});
+  executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 2294,
+                                           .mismatch_end_token_value = 0.0f});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetSuppressTokensConfig(SuppressTokensConfig(
+      /*suppress_tokens=*/absl::flat_hash_set<int>({246})));
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
+  // Expect the output to be " How's it" instead of " How's it go go go"
+  // because the token 246 is suppressed.
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How's it");
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids,
+                       tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids, responses.GetTexts()[0]);
+}
+
+TEST_F(SessionAdvancedTest,
+       RunDecodeWithSuppressTokensConfigFromSessionConfig) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  session_config.SetSuppressTokensConfig(SuppressTokensConfig(
+      /*suppress_tokens=*/absl::flat_hash_set<int>({18})));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it goinging"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {18}, {2294}});
+  executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 2294,
+                                           .mismatch_end_token_value = 0.0f});
+  ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ExecutionManager> execution_manager,
+      ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
+                                       std::move(executor),
+                                       /*vision_executor_settings=*/nullptr,
+                                       /*audio_executor_settings=*/nullptr,
+                                       /*litert_env=*/nullptr));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
+      SessionAdvanced::Create(execution_manager, tokenizer_.get(),
+                              session_config, /*benchmark_info=*/std::nullopt));
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode());
+  // Expect the output to be " How's it" instead of " How's it go go go"
+  // because the token 246 is suppressed.
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How's it go");
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids,
+                       tokenizer_->TokenIdsToText(responses.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids, responses.GetTexts()[0]);
+}
+
 TEST_F(SessionAdvancedTest,
        RunDecodeAsyncWithConstrainedDecodingWithInternalSampler) {
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -847,16 +1110,14 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutableSamplerParams() = sampler_params;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -897,7 +1158,7 @@ TEST_F(SessionAdvancedTest,
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -913,16 +1174,14 @@ TEST_F(SessionAdvancedTest,
   session_config.SetStartTokenId(2);
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -972,7 +1231,7 @@ TEST_F(SessionAdvancedTest, SaveAndRewindCheckpoint) {
   decode_config.SetMaxOutputTokens(2);
   ASSERT_OK_AND_ASSIGN(auto responses1, session->RunDecode(decode_config));
   EXPECT_EQ(responses1.GetTexts().size(), 1);
-  EXPECT_EQ(responses1.GetTexts()[0], " How'");
+  EXPECT_EQ(responses1.GetTexts()[0], "How'");
   EXPECT_THAT(responses1.GetTokenIds()[0], testing::ElementsAre(224, 24));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids1,
                        tokenizer_->TokenIdsToText(responses1.GetTokenIds()[0]));
@@ -985,7 +1244,7 @@ TEST_F(SessionAdvancedTest, SaveAndRewindCheckpoint) {
   decode_config.SetMaxOutputTokens(2);
   ASSERT_OK_AND_ASSIGN(auto responses3, session->RunDecode(decode_config));
   EXPECT_EQ(responses3.GetTexts().size(), 1);
-  EXPECT_EQ(responses3.GetTexts()[0], " How'");
+  EXPECT_EQ(responses3.GetTexts()[0], "How'");
   EXPECT_THAT(responses3.GetTokenIds()[0], testing::ElementsAre(224, 24));
   ASSERT_OK_AND_ASSIGN(auto text_from_ids3,
                        tokenizer_->TokenIdsToText(responses3.GetTokenIds()[0]));
@@ -1028,20 +1287,134 @@ TEST_F(SessionAdvancedTest, GetCurrentStep) {
   EXPECT_EQ(step3, 10);
 }
 
+TEST_F(SessionAdvancedTest, RewindToStep) {
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  // Initially step should be 8.
+  ASSERT_OK_AND_ASSIGN(int step1, session->GetCurrentStep());
+  EXPECT_EQ(step1, 8);
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetMaxOutputTokens(2);
+  ASSERT_OK_AND_ASSIGN(auto responses1, session->RunDecode(decode_config));
+  EXPECT_EQ(responses1.GetTexts().size(), 1);
+  EXPECT_EQ(responses1.GetTexts()[0], "How'");
+  EXPECT_THAT(responses1.GetTokenIds()[0], testing::ElementsAre(224, 24));
+
+  // After decode, step should be 10.
+  ASSERT_OK_AND_ASSIGN(int step2, session->GetCurrentStep());
+  EXPECT_EQ(step2, 10);
+
+  // Rewind to step 8.
+  EXPECT_OK(session->RewindToStep(8));
+  ASSERT_OK_AND_ASSIGN(int step3, session->GetCurrentStep());
+  EXPECT_EQ(step3, 8);
+
+  // Decoded tokens should be the same as the first decode call.
+  ASSERT_OK_AND_ASSIGN(auto responses2, session->RunDecode(decode_config));
+  EXPECT_EQ(responses2.GetTexts().size(), 1);
+  EXPECT_EQ(responses2.GetTexts()[0], "How'");
+  EXPECT_THAT(responses2.GetTokenIds()[0], testing::ElementsAre(224, 24));
+
+  // Rewind to step 0.
+  EXPECT_OK(session->RewindToStep(0));
+  ASSERT_OK_AND_ASSIGN(int step4, session->GetCurrentStep());
+  EXPECT_EQ(step4, 0);
+}
+
+TEST_F(SessionAdvancedTest, RewindToCheckpointRecoversFromFailure) {
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
+  ASSERT_NE(fake_executor_, nullptr);
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  // Save checkpoint in clean state.
+  EXPECT_OK(session->SaveCheckpoint("checkpoint-1"));
+
+  // Simulate decode failure.
+  fake_executor_->SetDecodeStatus(
+      absl::InternalError("Simulated decode failure"));
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetMaxOutputTokens(2);
+  // This decode should fail.
+  EXPECT_THAT(
+      session->RunDecode(decode_config),
+      StatusIs(absl::StatusCode::kInternal, "Simulated decode failure"));
+
+  // Rewind to checkpoint. If the bug is present, last_task_ids_ will still
+  // point to the failed task. If fixed, it will point back to the prefill task.
+  EXPECT_OK(session->RewindToCheckpoint("checkpoint-1"));
+
+  // Restore decode status to OK.
+  fake_executor_->SetDecodeStatus(absl::OkStatus());
+
+  // Run decode again.
+  // If the bug is present, this will instantly fail with kDependentTaskFailed
+  // (propagated from the previous failed decode task) and return an error or
+  // empty result.
+  // If fixed, it will succeed and return the expected tokens.
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How'");
+}
+
+TEST_F(SessionAdvancedTest, RewindToStepRecoversFromFailure) {
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
+  ASSERT_NE(fake_executor_, nullptr);
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  // Get step after prefill (should be 8).
+  ASSERT_OK_AND_ASSIGN(int step_before_decode, session->GetCurrentStep());
+  EXPECT_EQ(step_before_decode, 8);
+
+  // Simulate decode failure.
+  fake_executor_->SetDecodeStatus(
+      absl::InternalError("Simulated decode failure"));
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetMaxOutputTokens(2);
+  // This decode should fail.
+  EXPECT_THAT(
+      session->RunDecode(decode_config),
+      StatusIs(absl::StatusCode::kInternal, "Simulated decode failure"));
+
+  // Rewind to step before decode. If the bug is present, last_task_ids_ will
+  // still point to the failed task. If fixed, it will be cleared.
+  EXPECT_OK(session->RewindToStep(step_before_decode));
+
+  // Restore decode status to OK.
+  fake_executor_->SetDecodeStatus(absl::OkStatus());
+
+  // Run decode again.
+  // If the bug is present, this will instantly fail with kDependentTaskFailed.
+  // If fixed, it will succeed.
+  ASSERT_OK_AND_ASSIGN(auto responses, session->RunDecode(decode_config));
+  EXPECT_EQ(responses.GetTexts().size(), 1);
+  EXPECT_EQ(responses.GetTexts()[0], "How'");
+}
+
 TEST_F(SessionAdvancedTest, RunPrefillAndDecodeAsyncWithInternalSampler) {
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -1070,7 +1443,7 @@ TEST_F(SessionAdvancedTest, RunPrefillAndDecodeAsyncWithInternalSampler) {
   EXPECT_EQ(task_state, TaskState::kDone);
   EXPECT_EQ(texts.size(), 7);
   EXPECT_THAT(texts,
-              testing::ElementsAre(" How", "'", "s", " it", " go", "ing", "?"));
+              testing::ElementsAre("How", "'", "s", " it", " go", "ing", "?"));
 }
 
 TEST_F(SessionAdvancedTest, RunPrefillAndDecodeAsyncWithExternalSampler) {
@@ -1081,14 +1454,11 @@ TEST_F(SessionAdvancedTest, RunPrefillAndDecodeAsyncWithExternalSampler) {
   session_config.SetStartTokenId(2);
   // CPU backend will use internal sampler.
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -1117,7 +1487,7 @@ TEST_F(SessionAdvancedTest, RunPrefillAndDecodeAsyncWithExternalSampler) {
   EXPECT_EQ(task_state, TaskState::kDone);
   EXPECT_EQ(texts.size(), 7);
   EXPECT_THAT(texts,
-              testing::ElementsAre(" How", "'", "s", " it", " go", "ing", "?"));
+              testing::ElementsAre("How", "'", "s", " it", " go", "ing", "?"));
 }
 
 TEST_F(SessionAdvancedTest, GenerateContentStream) {
@@ -1126,14 +1496,11 @@ TEST_F(SessionAdvancedTest, GenerateContentStream) {
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -1160,7 +1527,7 @@ TEST_F(SessionAdvancedTest, GenerateContentStream) {
   EXPECT_EQ(task_state, TaskState::kDone);
   EXPECT_EQ(texts.size(), 7);
   EXPECT_THAT(texts,
-              testing::ElementsAre(" How", "'", "s", " it", " go", "ing", "?"));
+              testing::ElementsAre("How", "'", "s", " it", " go", "ing", "?"));
 }
 
 TEST_F(SessionAdvancedTest, RunPrefillEmptyInput) {
@@ -1169,14 +1536,11 @@ TEST_F(SessionAdvancedTest, RunPrefillEmptyInput) {
   session_config.GetMutableSamplerParams() = sampler_params_;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -1197,17 +1561,13 @@ TEST_F(SessionAdvancedTest, RunPrefillEmptyInput) {
 
 TEST_F(SessionAdvancedTest, RunPrefillAsyncFailed) {
   // Configure the executor to fail at prefill.
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
 
-  auto* fake_executor = static_cast<FakeLlmExecutor*>(executor.get());
-  fake_executor->SetPrefillStatus(absl::InternalError("Prefill failed"));
+  executor->SetPrefillStatus(absl::InternalError("Prefill failed"));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
@@ -1244,16 +1604,12 @@ TEST_F(SessionAdvancedTest, RunPrefillAsyncFailed) {
 
 TEST_F(SessionAdvancedTest, RunDecodeAsyncFailed) {
   // Configure the executor to fail at decode.
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
-  auto* fake_executor = static_cast<FakeLlmExecutor*>(executor.get());
-  fake_executor->SetDecodeStatus(absl::InternalError("Decode failed"));
+  auto executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
+  executor->SetDecodeStatus(absl::InternalError("Decode failed"));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
@@ -1292,14 +1648,11 @@ TEST_F(SessionAdvancedTest, RunDecodeAsyncFailed) {
 
 TEST_F(SessionAdvancedTest, RunDecodeAsyncWithCancellationWithInternalSampler) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1347,14 +1700,11 @@ TEST_F(SessionAdvancedTest, RunDecodeAsyncWithCancellationWithInternalSampler) {
 
 TEST_F(SessionAdvancedTest, RunDecodeAsyncWithCancellationWithExternalSampler) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1405,14 +1755,11 @@ TEST_F(SessionAdvancedTest, RunDecodeAsyncWithCancellationWithExternalSampler) {
 TEST_F(SessionAdvancedTest,
        RunDecodeAsyncWithTaskCancellationWithInternalSampler) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1461,14 +1808,11 @@ TEST_F(SessionAdvancedTest,
 TEST_F(SessionAdvancedTest,
        RunDecodeAsyncWithTaskCancellationWithExternalSampler) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1529,6 +1873,17 @@ class SessionAdvancedCancellationTest : public testing::TestWithParam<bool> {
     model_resources_ = std::unique_ptr<ModelResources>();
     sampler_params_.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
   }
+
+  std::unique_ptr<FakeLlmExecutor> CreateFakeLlmExecutor(
+      std::vector<std::vector<int>> prefill_tokens,
+      std::vector<std::vector<int>> decode_tokens,
+      std::optional<std::vector<float>> audio_embedding = std::nullopt) {
+    auto batch_size = decode_tokens.empty() ? 1 : decode_tokens[0].size();
+    return std::make_unique<FakeLlmExecutor>(tokenizer_->GetVocabSize(),
+                                             prefill_tokens, decode_tokens,
+                                             batch_size, audio_embedding);
+  }
+
   bool use_benchmark_info_ = GetParam();
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<ModelResources> model_resources_;
@@ -1538,16 +1893,13 @@ class SessionAdvancedCancellationTest : public testing::TestWithParam<bool> {
 TEST_P(SessionAdvancedCancellationTest,
        RunDecodeAsyncCancelThenGenerateWithBenchmarkWithInternalSamplerFailed) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294},
-                              // The second prefill doesn't have bos token.
-                              {90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294},
+                          // The second prefill doesn't have bos token.
+                          {90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1612,16 +1964,13 @@ TEST_P(SessionAdvancedCancellationTest,
 TEST_P(SessionAdvancedCancellationTest,
        RunDecodeAsyncCancelThenGenerateWithBenchmarkWithExternalSamplerFailed) {
   // Configure the executor to have a delay to simulate a long-running task.
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294},
-                              // The second prefill doesn't have bos token.
-                              {90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294},
+                          // The second prefill doesn't have bos token.
+                          {90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   fake_executor->SetDecodeDelay(absl::Milliseconds(200));
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
@@ -1690,14 +2039,11 @@ INSTANTIATE_TEST_SUITE_P(SessionAdvancedCancellationTest,
                          testing::PrintToStringParamName());
 
 TEST_F(SessionAdvancedTest, RunPrefillAsyncOnCancelledSession) {
-  ASSERT_OK_AND_ASSIGN(
-      auto fake_executor,
-      CreateFakeLlmExecutor(
-          // "Hello World!"
-          /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
-          // "How's it going?"
-          /*decode_tokens=*/{
-              {224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+  auto fake_executor = CreateFakeLlmExecutor(
+      // "Hello World!"
+      /*prefill_tokens=*/{{2, 90, 547, 58, 735, 210, 466, 2294}},
+      // "How's it going?"
+      /*decode_tokens=*/{{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.GetMutableSamplerParams() = sampler_params_;
@@ -1749,15 +2095,13 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutablePromptTemplates().mutable_model()->set_prefix(
       "<test>Model\n");
 
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // Expected tokens: "</s><test>User\nHello World!" +
-          // "<end>\n<test>Model\n"
-          /*prefill_tokens=*/{{2, 4, 0, 39, 637, 0, 3328, 8, 179, 90, 547, 58,
-                               735, 210, 466, 2294},
-                              {0, 40, 23, 0, 4, 0, 39, 637, 0, 197, 979, 3076}},
-          /*decode_tokens=*/{{224}}));
+  auto executor = CreateFakeLlmExecutor(
+      // Expected tokens: "</s><test>User\nHello World!" +
+      // "<end>\n<test>Model\n"
+      /*prefill_tokens=*/{{2, 4, 0, 39, 637, 0, 3328, 8, 179, 90, 547, 58, 735,
+                           210, 466, 2294},
+                          {0, 40, 23, 0, 4, 0, 39, 637, 0, 197, 979, 3076}},
+      /*decode_tokens=*/{{224}});
 
   proto::BenchmarkParams benchmark_params;
   BenchmarkInfo benchmark_info(benchmark_params);
@@ -1777,7 +2121,8 @@ TEST_F(SessionAdvancedTest,
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("Hello World!"));
   EXPECT_OK(session->RunPrefill(inputs));
-  EXPECT_EQ(session->GetBenchmarkInfo()->GetTotalPrefillTurns(), 1);
+  ASSERT_OK_AND_ASSIGN(auto actual_benchmark_info, session->GetBenchmarkInfo());
+  EXPECT_EQ(actual_benchmark_info.GetTotalPrefillTurns(), 1);
 }
 
 TEST_F(SessionAdvancedTest,
@@ -1795,12 +2140,11 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutablePromptTemplates().mutable_model()->set_prefix(
       "<test>Model\n");
 
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // Expected tokens: "Hello World!" (No templates)
-          /*prefill_tokens=*/{{90, 547, 58, 735, 210, 466, 2294}},
-          /*decode_tokens=*/{{224}}));
+  auto executor = CreateFakeLlmExecutor(
+      // Expected tokens: "Hello World!" (No templates)
+      // Expected tokens: "Hello World!" (No templates)
+      /*prefill_tokens=*/{{90, 547, 58, 735, 210, 466, 2294}},
+      /*decode_tokens=*/{{224}});
 
   proto::BenchmarkParams benchmark_params;
   benchmark_params.set_num_prefill_tokens(7);
@@ -1821,7 +2165,8 @@ TEST_F(SessionAdvancedTest,
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("Hello World!"));
   EXPECT_OK(session->RunPrefill(inputs));
-  EXPECT_EQ(session->GetBenchmarkInfo()->GetTotalPrefillTurns(), 1);
+  ASSERT_OK_AND_ASSIGN(auto actual_benchmark_info, session->GetBenchmarkInfo());
+  EXPECT_EQ(actual_benchmark_info.GetTotalPrefillTurns(), 1);
 }
 
 TEST_F(SessionAdvancedTest,
@@ -1829,7 +2174,7 @@ TEST_F(SessionAdvancedTest,
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -1843,16 +2188,14 @@ TEST_F(SessionAdvancedTest,
   session_config.GetMutableSamplerParams() = sampler_params;
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetStartTokenId(2);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
 
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
@@ -1862,9 +2205,10 @@ TEST_F(SessionAdvancedTest,
                                        /*audio_executor_settings=*/nullptr,
                                        /*litert_env=*/nullptr));
 
-  auto session =
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
       SessionAdvanced::Create(execution_manager, tokenizer_.get(),
-                              session_config, /*benchmark_info=*/std::nullopt);
+                              session_config, /*benchmark_info=*/std::nullopt));
 
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("How"));
@@ -1876,11 +2220,11 @@ TEST_F(SessionAdvancedTest,
   auto decode_config = DecodeConfig::CreateDefault();
   decode_config.SetConstraint(&constraint);
 
-  EXPECT_OK((*session)->RunPrefill(inputs));
-  ASSERT_OK_AND_ASSIGN(auto task_controller, (*session)->RunDecodeAsync(
-                                                 CreateStreamingTestCallback(
-                                                     status, task_state, texts),
-                                                 decode_config));
+  EXPECT_OK(session->RunPrefill(inputs));
+  ASSERT_OK_AND_ASSIGN(auto task_controller,
+                       session->RunDecodeAsync(CreateStreamingTestCallback(
+                                                   status, task_state, texts),
+                                               decode_config));
 
   EXPECT_OK(task_controller->WaitUntilDone(absl::Seconds(10)));
   EXPECT_OK(status);
@@ -1894,7 +2238,7 @@ TEST_F(SessionAdvancedTest,
   // Fake constraint that expects "'s it".
   std::vector<int> expected_token_ids = {24, 8, 66, 0};
   auto constraint =
-      FakeConstraint(expected_token_ids, /*vocabulary_size=*/2560);
+      FakeConstraint(expected_token_ids, tokenizer_->GetVocabSize());
 
   const std::vector<std::vector<int>> stop_token_ids = {{2294}, {0}};
   // Top P sampler.
@@ -1910,16 +2254,14 @@ TEST_F(SessionAdvancedTest,
   session_config.SetStartTokenId(2);
   session_config.SetUseExternalSampler(true);
   session_config.SetSamplerBackend(Backend::CPU);
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/{{2, 224},  // The first prefill.
-                              {0}},  // The expected prefill tokens that after
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/{{2, 224},  // The first prefill.
+                          {0}},      // The expected prefill tokens that after
                                      // stop tokens are found in decoding with
                                      // sampler. That is, the last
                                      // sampled tokens at stop condition.
                                      // "How's it going?"
-          /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}}));
+      /*decode_tokens=*/{{24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
 
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
@@ -1929,9 +2271,10 @@ TEST_F(SessionAdvancedTest,
                                        /*audio_executor_settings=*/nullptr,
                                        /*litert_env=*/nullptr));
 
-  auto session =
+  ASSERT_OK_AND_ASSIGN(
+      auto session,
       SessionAdvanced::Create(execution_manager, tokenizer_.get(),
-                              session_config, /*benchmark_info=*/std::nullopt);
+                              session_config, /*benchmark_info=*/std::nullopt));
 
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("How"));
@@ -1942,11 +2285,11 @@ TEST_F(SessionAdvancedTest,
   auto decode_config = DecodeConfig::CreateDefault();
   decode_config.SetConstraint(&constraint);
 
-  EXPECT_OK((*session)->RunPrefill(inputs));
-  ASSERT_OK_AND_ASSIGN(auto task_controller, (*session)->RunDecodeAsync(
-                                                 CreateStreamingTestCallback(
-                                                     status, task_state, texts),
-                                                 decode_config));
+  EXPECT_OK(session->RunPrefill(inputs));
+  ASSERT_OK_AND_ASSIGN(auto task_controller,
+                       session->RunDecodeAsync(CreateStreamingTestCallback(
+                                                   status, task_state, texts),
+                                               decode_config));
 
   EXPECT_OK(task_controller->WaitUntilDone(absl::Seconds(10)));
   EXPECT_OK(status);
@@ -1970,22 +2313,20 @@ TEST_F(SessionAdvancedTest, RunIncrementalPrefillWithDecode) {
       "Model:");
   session_config.GetMutableLlmModelType().mutable_gemma3n();
 
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          /*prefill_tokens=*/
-          {
-              {2, 423, 8, 179, 29, 207, 19, 547, 58},  // prefill chunk 1.1
-              {735, 210, 466, 2294},                   // prefill chunk 1.2
-              {433, 2172, 1920, 432, 197, 979, 3076,
-               29},  // prefill ran before decode with turn change template
-              {423, 8, 179, 29, 207, 19, 547, 58, 735, 210, 466,
-               2294},  // prefill chunk 2.1
-              {433, 2172, 1920, 432, 197, 979, 3076,
-               29},  // prefill ran before decode with turn change template
-          },
-          /*decode_tokens=*/
-          {{1}, {2}, {3}, {2294}, {1}, {2}, {3}, {2294}}));
+  auto executor = CreateFakeLlmExecutor(
+      /*prefill_tokens=*/
+      {
+          {2, 423, 8, 179, 29, 207, 19, 547, 58},  // prefill chunk 1.1
+          {735, 210, 466, 2294},                   // prefill chunk 1.2
+          {433, 2172, 1920, 432, 197, 979, 3076,
+           29},  // prefill ran before decode with turn change template
+          {423, 8, 179, 29, 207, 19, 547, 58, 735, 210, 466,
+           2294},  // prefill chunk 2.1
+          {433, 2172, 1920, 432, 197, 979, 3076,
+           29},  // prefill ran before decode with turn change template
+      },
+      /*decode_tokens=*/
+      {{1}, {2}, {3}, {2294}, {1}, {2}, {3}, {2294}});
   ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ExecutionManager> execution_manager,
       ThreadedExecutionManager::Create(tokenizer_.get(), model_resources_.get(),
@@ -2046,20 +2387,17 @@ TEST_F(SessionAdvancedTest, ProcessAndCombineContentsTextAndAudioSuccess) {
                                    std::string(kTestAudioModelPath))
                                       .string(),
                                   /*max_sequence_length=*/0, Backend::CPU));
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "User:Hello World!<start_of_audio>[END]Model:"
-          /*prefill_tokens=*/{{2,   423, 8,   179, 29,  207,  19,
-                               547, 58,  735, 210, 466, 2294, 256000,
-                               -2,  -2,  -2,  -2,  -2,  -4},
-                              {433, 2172, 1920, 432, 197, 979, 3076, 29}},
-          // "How's it going?"
-          /*decode_tokens=*/
-          {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}},
-          /*audio_embedding=*/
-          std::vector<float>(kExpectedAudioEmbedding.begin(),
-                             kExpectedAudioEmbedding.end())));
+  auto executor = CreateFakeLlmExecutor(
+      // "User:Hello World!<start_of_audio>[END]Model:"
+      /*prefill_tokens=*/{{2,   423, 8,    179,    29, 207, 19, 547, 58, 735,
+                           210, 466, 2294, 256000, -2, -2,  -2, -2,  -2, -4},
+                          {433, 2172, 1920, 432, 197, 979, 3076, 29}},
+      // "How's it going?"
+      /*decode_tokens=*/
+      {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}},
+      /*audio_embedding=*/
+      std::vector<float>(kExpectedAudioEmbedding.begin(),
+                         kExpectedAudioEmbedding.end()));
 
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
@@ -2111,23 +2449,21 @@ TEST_F(SessionAdvancedTest, ProcessAndCombineContentsTextAudioTextSuccess) {
                                    std::string(kTestAudioModelPath))
                                       .string(),
                                   /*max_sequence_length=*/0, Backend::CPU));
-  ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      CreateFakeLlmExecutor(
-          // "User:Hello World!<start_of_audio>What does the audio say?"
-          // "[END]Model:"
-          /*prefill_tokens=*/
-          {{2,   423,  8,      179, 29,   207, 19, 547, 58,  735, 210,
-            466, 2294, 256000, -2,  -2,   -2,  -2, -2,  -4,  583, 378,
-            844, 166,  3,      14,  1252, 54,  58, 626, 2295},
-           {3995, 2172, 1920, 432, 197, 979, 3076, 29}},
+  auto executor = CreateFakeLlmExecutor(
+      // "User:Hello World!<start_of_audio>What does the audio say?"
+      // "[END]Model:"
+      /*prefill_tokens=*/
+      {{2,   423,  8,      179, 29,   207, 19, 547, 58,  735, 210,
+        466, 2294, 256000, -2,  -2,   -2,  -2, -2,  -4,  583, 378,
+        844, 166,  3,      14,  1252, 54,  58, 626, 2295},
+       {3995, 2172, 1920, 432, 197, 979, 3076, 29}},
 
-          // "How's it going?"
-          /*decode_tokens=*/
-          {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}},
-          /*audio_embedding=*/
-          std::vector<float>(kExpectedAudioEmbedding.begin(),
-                             kExpectedAudioEmbedding.end())));
+      // "How's it going?"
+      /*decode_tokens=*/
+      {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}},
+      /*audio_embedding=*/
+      std::vector<float>(kExpectedAudioEmbedding.begin(),
+                         kExpectedAudioEmbedding.end()));
 
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
@@ -2188,13 +2524,13 @@ TEST_F(SessionAdvancedTest, RunTextScoringWithoutTokenLengthsSuccess) {
   EXPECT_OK(session->RunPrefill(inputs));
   std::vector<absl::string_view> target_texts;
   target_texts.push_back("How's it going?");
-  const auto responses = session->RunTextScoring(target_texts,
-                                                 /*store_token_lengths=*/false);
-  EXPECT_OK(responses);
+  ASSERT_OK_AND_ASSIGN(
+      const auto responses,
+      session->RunTextScoring(target_texts, /*store_token_lengths=*/false));
   // Expect a single output candidate with score 0.0f.
-  EXPECT_EQ(responses->GetScores().size(), 1);
-  EXPECT_EQ(responses->GetScores()[0], 0.0f);
-  EXPECT_FALSE(responses->GetTokenLengths().has_value());
+  EXPECT_EQ(responses.GetScores().size(), 1);
+  EXPECT_EQ(responses.GetScores()[0], 0.0f);
+  EXPECT_FALSE(responses.GetTokenLengths().has_value());
 }
 
 TEST_F(SessionAdvancedTest, RunTextScoringWithTokenLengthsSuccess) {
@@ -2204,15 +2540,15 @@ TEST_F(SessionAdvancedTest, RunTextScoringWithTokenLengthsSuccess) {
   EXPECT_OK(session->RunPrefill(inputs));
   std::vector<absl::string_view> target_texts;
   target_texts.push_back("How's it going?");
-  const auto responses = session->RunTextScoring(target_texts,
-                                                 /*store_token_lengths=*/true);
-  EXPECT_OK(responses);
+  ASSERT_OK_AND_ASSIGN(
+      const auto responses,
+      session->RunTextScoring(target_texts, /*store_token_lengths=*/true));
   // Expect a single output candidate with score 0.0f and token length 7.
-  EXPECT_EQ(responses->GetScores().size(), 1);
-  EXPECT_EQ(responses->GetScores()[0], 0.0f);
-  EXPECT_TRUE(responses->GetTokenLengths().has_value());
-  EXPECT_EQ(responses->GetTokenLengths()->size(), 1);
-  EXPECT_EQ((*responses->GetTokenLengths())[0], 7);
+  EXPECT_EQ(responses.GetScores().size(), 1);
+  EXPECT_EQ(responses.GetScores()[0], 0.0f);
+  EXPECT_TRUE(responses.GetTokenLengths().has_value());
+  EXPECT_EQ(responses.GetTokenLengths()->size(), 1);
+  EXPECT_EQ((*responses.GetTokenLengths())[0], 7);
 }
 
 TEST_F(SessionAdvancedTest, RunTextScoringAsyncEmptyTargetTextFailure) {
@@ -2307,6 +2643,72 @@ TEST_F(SessionAdvancedTest, RunTextScoringAsyncWithTokenLengthsSuccess) {
   EXPECT_TRUE(responses->GetTokenLengths().has_value());
   EXPECT_EQ(responses->GetTokenLengths()->size(), 1);
   EXPECT_EQ((*responses->GetTokenLengths())[0], 7);
+}
+
+class FakeEngineForEnvironmentTest : public Engine {
+ public:
+  explicit FakeEngineForEnvironmentTest(const ::litert::Environment* env)
+      : env_(env) {}
+
+  absl::StatusOr<const ::litert::Environment*> GetEnvironment() const override {
+    if (env_ == nullptr) {
+      return absl::NotFoundError("LiteRT environment is not available.");
+    }
+    return env_;
+  }
+
+  const EngineSettings& GetEngineSettings() const override {
+    ABSL_LOG(FATAL) << "Not needed for test.";
+  }
+
+  const support::Tokenizer& GetTokenizer() const override {
+    ABSL_LOG(FATAL) << "Not needed for test.";
+  }
+
+  absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
+      const override {
+    return absl::UnimplementedError("Not needed for test.");
+  }
+
+  absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
+      const override {
+    return absl::UnimplementedError("Not needed for test.");
+  }
+
+  absl::StatusOr<std::unique_ptr<SessionInterface>> CreateSession(
+      const SessionConfig& session_config) override {
+    return absl::UnimplementedError("Not needed for test.");
+  }
+
+ private:
+  const ::litert::Environment* env_;
+};
+
+TEST_F(SessionAdvancedTest, GetEnvironmentWithoutEngineReturnsNotFoundError) {
+  using ::testing::HasSubstr;
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
+  EXPECT_THAT(session->GetEnvironment(),
+              StatusIs(absl::StatusCode::kNotFound,
+                       HasSubstr("Engine is not available")));
+}
+
+TEST_F(SessionAdvancedTest, GetEnvironmentWithEngineReturnsEnvironment) {
+  LITERT_ASSERT_OK_AND_ASSIGN(auto litert_env,
+                              ::litert::Environment::Create({}));
+  FakeEngineForEnvironmentTest fake_engine(&litert_env);
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession(&fake_engine));
+  ASSERT_OK_AND_ASSIGN(const auto* env, session->GetEnvironment());
+  EXPECT_EQ(env, &litert_env);
+}
+
+TEST_F(SessionAdvancedTest, ClonedSessionPreservesEngine) {
+  LITERT_ASSERT_OK_AND_ASSIGN(auto litert_env,
+                              ::litert::Environment::Create({}));
+  FakeEngineForEnvironmentTest fake_engine(&litert_env);
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession(&fake_engine));
+  ASSERT_OK_AND_ASSIGN(auto clone, session->CloneAsync([](auto) {}));
+  ASSERT_OK_AND_ASSIGN(const auto* env, clone->GetEnvironment());
+  EXPECT_EQ(env, &litert_env);
 }
 
 }  // namespace

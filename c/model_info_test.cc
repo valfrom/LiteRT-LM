@@ -1,0 +1,242 @@
+// Copyright 2026 The ODML Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "c/model_info.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+
+#if defined(__APPLE__)
+#include "engine.h"  // NOLINT
+#else
+#include "c/engine.h"
+#endif
+
+#include <gtest/gtest.h>
+
+namespace {
+
+std::string GetRunfilePath(const std::string& relative_path) {
+  std::string srcdir = ::testing::SrcDir();
+  // On Windows, SrcDir() may return paths with backslashes. The LiteRT LM C API
+  // expects forward slashes.
+  std::replace(srcdir.begin(), srcdir.end(), '\\', '/');
+  return srcdir + "/" + relative_path;
+}
+
+TEST(ModelInfoCTest, InspectLoadedFile) {
+  std::string model_path = GetRunfilePath(
+      "litert_lm/runtime/testdata/test_lm.litertlm");
+  LiteRtLmLoadedFile* file = litert_lm_loaded_file_create(model_path.c_str());
+  ASSERT_NE(file, nullptr);
+
+  // Verify core capabilities and fallback defaults
+  EXPECT_EQ(litert_lm_loaded_file_model_type(file), kLiteRtLmModelTypeLlm);
+  EXPECT_EQ(litert_lm_loaded_file_embedding_dimension(file), -1);
+  EXPECT_EQ(
+      litert_lm_loaded_file_embedding_signature_selection(file, nullptr, 0),
+      -1);
+  EXPECT_FALSE(litert_lm_loaded_file_has_speculative_decoding_support(file));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_thinking(file));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_function_calling(file));
+  EXPECT_EQ(litert_lm_loaded_file_max_vision_token_budget(file), -1);
+  EXPECT_EQ(litert_lm_loaded_file_vision_signature_selection(file, nullptr, 0),
+            -1);
+  EXPECT_EQ(litert_lm_loaded_file_min_runtime_version(file), nullptr);
+  EXPECT_EQ(litert_lm_loaded_file_min_runtime_version(nullptr), nullptr);
+
+  // Verify modality-specific backends for text (default to CPU, GPU)
+  LiteRtLmBackendType text_backends[3];
+  int32_t text_backend_count =
+      litert_lm_loaded_file_modality_supported_backends(
+          file, kLiteRtLmModalityText, text_backends, 3);
+  EXPECT_EQ(text_backend_count, 2);
+  EXPECT_EQ(text_backends[0], kLiteRtLmBackendTypeCpu);
+  EXPECT_EQ(text_backends[1], kLiteRtLmBackendTypeGpu);
+
+  // Verify modality-specific backends for vision (not present -> 0)
+  EXPECT_EQ(litert_lm_loaded_file_modality_supported_backends(
+                file, kLiteRtLmModalityVision, nullptr, 0),
+            0);
+  EXPECT_EQ(
+      litert_lm_loaded_file_modality_npu_brand(file, kLiteRtLmModalityText),
+      kLiteRtLmNpuBrandUnknown);
+  EXPECT_EQ(
+      litert_lm_loaded_file_modality_soc_name(file, kLiteRtLmModalityText),
+      nullptr);
+
+  // Verify modalities
+  EXPECT_TRUE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityText));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityVision));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityAudio));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityVideo));
+
+  // Verify default sampler parameters (from model config)
+  EXPECT_EQ(litert_lm_loaded_file_sampler_type(file), kLiteRtLmSamplerTypeTopP);
+  EXPECT_FLOAT_EQ(litert_lm_loaded_file_sampler_temperature(file), 0.0f);
+  EXPECT_EQ(litert_lm_loaded_file_sampler_top_k(file), 1);
+  EXPECT_FLOAT_EQ(litert_lm_loaded_file_sampler_top_p(file), 0.7f);
+
+  litert_lm_loaded_file_delete(file);
+}
+
+TEST(ModelInfoCTest, GetMaxContextTokens) {
+  // Test null handle behavior
+  EXPECT_EQ(litert_lm_loaded_file_max_context_tokens(nullptr), 0);
+  EXPECT_FALSE(litert_lm_loaded_file_is_dynamic_context(nullptr));
+
+  std::string model_path = GetRunfilePath(
+      "litert_lm/runtime/testdata/test_lm.litertlm");
+  LiteRtLmLoadedFile* file = litert_lm_loaded_file_create(model_path.c_str());
+  ASSERT_NE(file, nullptr);
+
+  EXPECT_EQ(litert_lm_loaded_file_max_context_tokens(file), 128);
+  EXPECT_FALSE(litert_lm_loaded_file_is_dynamic_context(file));
+
+  litert_lm_loaded_file_delete(file);
+}
+
+TEST(ModelInfoCTest, CreateInvalidPathReturnsNull) {
+  LiteRtLmLoadedFile* file =
+      litert_lm_loaded_file_create("/invalid/path/that/does/not/exist");
+  EXPECT_EQ(file, nullptr);
+}
+
+TEST(ModelInfoCTest, InspectMultimodalCapabilities) {
+  std::string model_path = GetRunfilePath(
+      "litert_lm/runtime/testdata/dummy_vision_with_adapter.litertlm");
+  LiteRtLmLoadedFile* file = litert_lm_loaded_file_create(model_path.c_str());
+  ASSERT_NE(file, nullptr);
+
+  // Verify modality
+  EXPECT_TRUE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityVision));
+
+  // Verify supported lengths
+  // 1. Get count only
+  int32_t count =
+      litert_lm_loaded_file_vision_signature_selection(file, nullptr, 0);
+  EXPECT_EQ(count, 1);
+
+  // 2. Fetch values
+  int32_t lengths[1] = {0};
+  int32_t written =
+      litert_lm_loaded_file_vision_signature_selection(file, lengths, 1);
+  EXPECT_EQ(written, 1);
+  EXPECT_EQ(lengths[0], 5);
+
+  litert_lm_loaded_file_delete(file);
+}
+
+TEST(ModelInfoCTest, NullPointerSafety) {
+  EXPECT_FALSE(litert_lm_loaded_file_has_speculative_decoding_support(nullptr));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_thinking(nullptr));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_function_calling(nullptr));
+  EXPECT_EQ(litert_lm_loaded_file_max_vision_token_budget(nullptr), -1);
+  EXPECT_EQ(
+      litert_lm_loaded_file_vision_signature_selection(nullptr, nullptr, 0),
+      -1);
+  EXPECT_EQ(litert_lm_loaded_file_min_runtime_version(nullptr), nullptr);
+  EXPECT_EQ(litert_lm_loaded_file_modality_supported_backends(
+                nullptr, kLiteRtLmModalityText, nullptr, 0),
+            0);
+  EXPECT_EQ(
+      litert_lm_loaded_file_modality_npu_brand(nullptr, kLiteRtLmModalityText),
+      kLiteRtLmNpuBrandUnknown);
+  EXPECT_EQ(
+      litert_lm_loaded_file_modality_soc_name(nullptr, kLiteRtLmModalityText),
+      nullptr);
+  EXPECT_FALSE(litert_lm_loaded_file_supports_input_modality(
+      nullptr, kLiteRtLmModalityText));
+  EXPECT_EQ(litert_lm_loaded_file_model_type(nullptr),
+            kLiteRtLmModelTypeUnknown);
+  EXPECT_EQ(litert_lm_loaded_file_embedding_dimension(nullptr), -1);
+  EXPECT_EQ(
+      litert_lm_loaded_file_embedding_signature_selection(nullptr, nullptr, 0),
+      -1);
+  EXPECT_EQ(litert_lm_loaded_file_sampler_type(nullptr),
+            kLiteRtLmSamplerTypeUnspecified);
+  EXPECT_FLOAT_EQ(litert_lm_loaded_file_sampler_temperature(nullptr), 0.0f);
+  EXPECT_EQ(litert_lm_loaded_file_sampler_top_k(nullptr), 0);
+  EXPECT_FLOAT_EQ(litert_lm_loaded_file_sampler_top_p(nullptr), 0.0f);
+  litert_lm_loaded_file_delete(nullptr);
+}
+
+TEST(ModelInfoCTest, InspectAudioCapabilities) {
+  std::string model_path = GetRunfilePath(
+      "litert_lm/runtime/testdata/dummy_audio_only.litertlm");
+  LiteRtLmLoadedFile* file = litert_lm_loaded_file_create(model_path.c_str());
+  ASSERT_NE(file, nullptr);
+
+  // Verify audio modality
+  EXPECT_TRUE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityAudio));
+
+  // Verify supported backends for audio
+  LiteRtLmBackendType audio_backends[3];
+  int32_t count = litert_lm_loaded_file_modality_supported_backends(
+      file, kLiteRtLmModalityAudio, audio_backends, 3);
+  EXPECT_EQ(count, 2);
+  EXPECT_EQ(audio_backends[0], kLiteRtLmBackendTypeCpu);
+  EXPECT_EQ(audio_backends[1], kLiteRtLmBackendTypeGpu);
+
+  litert_lm_loaded_file_delete(file);
+}
+
+TEST(ModelInfoCTest, InspectEmbeddingCapabilities) {
+  std::string model_path = GetRunfilePath(
+      "litert_lm/runtime/testdata/test_embedding.litertlm");
+  LiteRtLmLoadedFile* file = litert_lm_loaded_file_create(model_path.c_str());
+  ASSERT_NE(file, nullptr);
+
+  EXPECT_EQ(litert_lm_loaded_file_model_type(file),
+            kLiteRtLmModelTypeEmbedding);
+  EXPECT_EQ(litert_lm_loaded_file_embedding_dimension(file), 768);
+  EXPECT_EQ(litert_lm_loaded_file_max_context_tokens(file), 128);
+  EXPECT_FALSE(litert_lm_loaded_file_is_dynamic_context(file));
+
+  EXPECT_TRUE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityText));
+  EXPECT_FALSE(litert_lm_loaded_file_supports_input_modality(
+      file, kLiteRtLmModalityVision));
+  EXPECT_EQ(litert_lm_loaded_file_max_vision_token_budget(file), -1);
+  EXPECT_EQ(
+      litert_lm_loaded_file_vision_signature_selection(file, nullptr, 0), -1);
+
+  LiteRtLmBackendType text_backends[3];
+  int32_t text_count = litert_lm_loaded_file_modality_supported_backends(
+      file, kLiteRtLmModalityText, text_backends, 3);
+  EXPECT_EQ(text_count, 2);
+  EXPECT_EQ(text_backends[0], kLiteRtLmBackendTypeCpu);
+  EXPECT_EQ(text_backends[1], kLiteRtLmBackendTypeGpu);
+
+  int32_t sig_count =
+      litert_lm_loaded_file_embedding_signature_selection(file, nullptr, 0);
+  EXPECT_EQ(sig_count, 1);
+  int32_t lengths[1] = {0};
+  int32_t written =
+      litert_lm_loaded_file_embedding_signature_selection(file, lengths, 1);
+  EXPECT_EQ(written, 1);
+  EXPECT_EQ(lengths[0], 128);
+
+  litert_lm_loaded_file_delete(file);
+}
+
+}  // namespace
+

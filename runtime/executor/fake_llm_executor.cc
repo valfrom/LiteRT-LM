@@ -15,6 +15,7 @@
 #include "runtime/executor/fake_llm_executor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
@@ -29,6 +31,7 @@
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/components/constrained_decoding/constrained_decoder.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
@@ -41,15 +44,18 @@ namespace {
 // Converts the given ids to logits TensorBuffer in the shape of [batch_size,
 // vocab_size].
 void DecodeIdsToLogits(const std::vector<int>& ids, int vocab_size,
-                       ::litert::TensorBuffer& output_logits) {
+                       ::litert::TensorBuffer& output_logits,
+                       const FakeLlmExecutor::DecodeLogitsOptions& options) {
   auto logits_span = ReferTensorBufferAsSpan<float>(output_logits);
   for (int i = 0; i < ids.size(); ++i) {
     for (int j = 0; j < vocab_size; ++j) {
       int index = i * vocab_size + j;
       if (ids[i] == j) {
-        (*logits_span)[index] = std::numeric_limits<float>::max();
+        (*logits_span)[index] = options.match_value;
+      } else if (j == options.end_token_id) {
+        (*logits_span)[index] = options.mismatch_end_token_value;
       } else {
-        (*logits_span)[index] = std::numeric_limits<float>::lowest();
+        (*logits_span)[index] = options.mismatch_value;
       }
     }
   }
@@ -107,11 +113,11 @@ absl::Status CheckEquivalent(absl::Span<T> expected, absl::Span<T> actual) {
 FakeLlmExecutor::FakeLlmExecutor(
     int vocab_size, const std::vector<std::vector<int>>& prefill_tokens_set,
     const std::vector<std::vector<int>>& decode_tokens_set, int batch_size,
-    std::optional<std::vector<float>> audio_embedding)
+    std::optional<std::vector<float>> projected_audio_embedding)
     : vocab_size_(vocab_size),
       prefill_tokens_set_(prefill_tokens_set),
       decode_tokens_set_(decode_tokens_set),
-      audio_embedding_set_(std::move(audio_embedding)),
+      projected_audio_embedding_set_(std::move(projected_audio_embedding)),
       batch_size_(batch_size),
       prefill_times_(0),
       decode_times_(0),
@@ -126,7 +132,7 @@ FakeLlmExecutor::FakeLlmExecutor(
 }
 
 absl::Status FakeLlmExecutor::Prefill(const ExecutorInputs& inputs) {
-  RETURN_IF_ERROR(prefill_status_);
+  ABSL_RETURN_IF_ERROR(prefill_status_);
   if (prefill_times_ >= prefill_tokens_set_.size()) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Prefill function has been called more times than the number of "
@@ -134,33 +140,37 @@ absl::Status FakeLlmExecutor::Prefill(const ExecutorInputs& inputs) {
         prefill_times_));
   }
   if (inputs.GetAudioDataPtr().ok()) {
-    if (!audio_embedding_set_.has_value()) {
+    if (!projected_audio_embedding_set_.has_value()) {
       return absl::InvalidArgumentError(
-          "Audio embedding is not set in the fake LLM executor.");
+          "Projected audio embedding is not set in the fake LLM executor.");
     }
-    ASSIGN_OR_RETURN(auto audio_embeddings, inputs.GetAudioEmbeddingsPtr());
-    LITERT_ASSIGN_OR_RETURN(auto audio_embeddings_span,
-                            ReferTensorBufferAsSpan<float>(*audio_embeddings));
-    RETURN_IF_ERROR(CheckEquivalent(absl::MakeSpan(*audio_embedding_set_),
-                                    audio_embeddings_span));
+    ABSL_ASSIGN_OR_RETURN(auto projected_audio_embeddings,
+                          inputs.GetProjectedAudioEmbeddingsPtr());
+    LITERT_ASSIGN_OR_RETURN(
+        auto projected_audio_embeddings_span,
+        ReferTensorBufferAsSpan<float>(*projected_audio_embeddings));
+    ABSL_RETURN_IF_ERROR(CheckEquivalent<const float>(
+        absl::MakeSpan(*projected_audio_embedding_set_),
+        static_cast<absl::Span<const float>>(projected_audio_embeddings_span)));
   }
-  ASSIGN_OR_RETURN(auto text_data, inputs.GetTextDataPtr());
-  auto text_token_ids_span =
-      ReferTensorBufferAsSpan<int>(text_data->GetTokenIds());
-  RETURN_IF_ERROR(
-      CheckEquivalent(absl::MakeSpan(prefill_tokens_set_[prefill_times_]),
-                      *text_token_ids_span));
+  ABSL_ASSIGN_OR_RETURN(auto text_data, inputs.GetTextDataPtr());
+  LITERT_ASSIGN_OR_RETURN(
+      auto text_token_ids_span,
+      ReferTensorBufferAsSpan<int>(text_data->GetTokenIds()));
+  ABSL_RETURN_IF_ERROR(CheckEquivalent<const int>(
+      absl::MakeSpan(prefill_tokens_set_[prefill_times_]),
+      text_token_ids_span));
   last_op_ = LastOp::kPrefill;
   processed_tokens_.AddProcessedTokens(prefill_tokens_set_[prefill_times_]);
   prefill_times_++;
-  current_step_ += text_token_ids_span->size();
-  prefill_tokens_total_ += text_token_ids_span->size();
+  current_step_ += text_token_ids_span.size();
+  prefill_tokens_total_ += text_token_ids_span.size();
   return absl::OkStatus();
 }
 
 absl::Status FakeLlmExecutor::Prefill(
     const ExecutorInputs& inputs, const ExecutorPrefillParams& prefill_params) {
-  RETURN_IF_ERROR(prefill_status_);
+  ABSL_RETURN_IF_ERROR(prefill_status_);
   if (prefill_params.GetCancelFlag() != nullptr &&
       prefill_params.GetCancelFlag()->load()) {
     return absl::CancelledError("Process cancelled.");
@@ -185,7 +195,7 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode() {
 absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
     const ExecutorDecodeParams& decode_params) {
   TryDecodeDelay();
-  RETURN_IF_ERROR(decode_status_);
+  ABSL_RETURN_IF_ERROR(decode_status_);
   if (last_op_ == LastOp::kNone) {
     return absl::FailedPreconditionError(
         "Decode called without prior prefill or decode.");
@@ -197,35 +207,35 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
         decode_times_));
   }
   std::vector<std::vector<int>> output_tokens;
-  if (decode_params.HasConstraintDecoder()) {
-    // If constraint decoder is set, we will decode logits and apply the mask
-    // from the constraint decoder to generate the final output tokens.
-    auto constraint_decoder = decode_params.GetConstraintDecoder();
+  if (ConstrainedDecoder* constrained_decoder =
+          decode_params.GetConstrainedDecoder();
+      constrained_decoder != nullptr) {
     // Get the last token ids from the last prefill or decode call.
     LITERT_ASSIGN_OR_RETURN(auto last_token_ids,
                             CreateTensorBuffer<int>({batch_size_, 1}));
-    auto last_token_ids_span = ReferTensorBufferAsSpan<int>(last_token_ids);
-
     if (last_op_ == LastOp::kDecode) {
       if (decode_times_ == 0) {
         return absl::InternalError("LastOp is Decode but decode_times_ is 0");
       }
       const auto& last_decode_tokens = decode_tokens_set_[decode_times_ - 1];
-      for (int i = 0; i < batch_size_; ++i) {
-        (*last_token_ids_span)[i] = last_decode_tokens[i];
+      {
+        LITERT_ASSIGN_OR_RETURN(auto last_token_ids_span,
+                                ReferTensorBufferAsSpan<int>(last_token_ids));
+        for (int i = 0; i < batch_size_; ++i) {
+          last_token_ids_span[i] = last_decode_tokens[i];
+        }
       }
       // Update the constraint state with the last token ids.
-      RETURN_IF_ERROR(
-          constraint_decoder->UpdateConstraintState(last_token_ids));
+      ABSL_RETURN_IF_ERROR(constrained_decoder->UpdateState(last_token_ids));
     }
 
     LITERT_ASSIGN_OR_RETURN(
         auto output_logits,
         CreateTensorBuffer<float>({batch_size_, 1, vocab_size_}));
     DecodeIdsToLogits(decode_tokens_set_[decode_times_], vocab_size_,
-                      output_logits);
-    // Apply the mask from the constraint decoder to the logits.
-    RETURN_IF_ERROR(constraint_decoder->MaskLogits(output_logits));
+                      output_logits, decode_logits_options_);
+    // Apply the constraint to the output logits.
+    ABSL_RETURN_IF_ERROR(constrained_decoder->ProcessLogits(output_logits));
     output_tokens = DecodeLogitsToIds(batch_size_, vocab_size_, output_logits,
                                       decode_tokens_set_);
   } else {
@@ -243,7 +253,7 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
 absl::Status FakeLlmExecutor::Decode(const ExecutorInputs& inputs,
                                      ::litert::TensorBuffer& output_logits) {
   TryDecodeDelay();
-  RETURN_IF_ERROR(decode_status_);
+  ABSL_RETURN_IF_ERROR(decode_status_);
   if (last_op_ == LastOp::kNone) {
     return absl::FailedPreconditionError(
         "Decode called without prior prefill or decode.");
@@ -256,13 +266,17 @@ absl::Status FakeLlmExecutor::Decode(const ExecutorInputs& inputs,
   }
   if (decode_times_ > 0) {
     // Check that the input tokens match the decode tokens from the last call.
-    auto input_span =
-        ReferTensorBufferAsSpan<int>(*(*inputs.GetTextTokenIdsPtr()));
-    RETURN_IF_ERROR(CheckEquivalent(
-        absl::MakeSpan(decode_tokens_set_[decode_times_ - 1]), *input_span));
+    ABSL_ASSIGN_OR_RETURN(const ::litert::TensorBuffer* text_token_ids,
+                          inputs.GetTextTokenIdsPtr());
+    {
+      LITERT_ASSIGN_OR_RETURN(auto input_span,
+                              ReferTensorBufferAsSpan<int>(*text_token_ids));
+      ABSL_RETURN_IF_ERROR(CheckEquivalent<const int>(
+          absl::MakeSpan(decode_tokens_set_[decode_times_ - 1]), input_span));
+    }
   }
   DecodeIdsToLogits(decode_tokens_set_[decode_times_], vocab_size_,
-                    output_logits);
+                    output_logits, decode_logits_options_);
   last_op_ = LastOp::kDecode;
   processed_tokens_.AddProcessedTokens(decode_tokens_set_[decode_times_]);
   decode_times_++;
@@ -275,7 +289,7 @@ absl::StatusOr<::litert::TensorBuffer> FakeLlmExecutor::DecodeLogits(
   LITERT_ASSIGN_OR_RETURN(
       auto output_logits,
       CreateTensorBuffer<float>({batch_size_, 1, vocab_size_}));
-  RETURN_IF_ERROR(Decode(inputs, output_logits));
+  ABSL_RETURN_IF_ERROR(Decode(inputs, output_logits));
   return output_logits;
 }
 
@@ -293,6 +307,40 @@ absl::Status FakeLlmExecutor::Reset() {
   prefill_tokens_total_ = 0;
   last_op_ = LastOp::kNone;
   return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<std::vector<int>>>
+DiffusionLlmFakeLlmExecutor::Decode(const ExecutorDecodeParams& decode_params) {
+  // Signal to the test thread that we have entered the Decode method.
+  decode_started_.store(true);
+
+  // Retrieve the cancellation token pointer passed from the tasks layer.
+  const std::atomic<bool>* cancelled = decode_params.GetCancelled();
+
+  // Safeguard: If the token is null, it means the tasks layer failed to
+  // propagate the cancellation token. Fail the test immediately.
+  if (cancelled == nullptr) {
+    return absl::InternalError("Cancellation token was not propagated!");
+  }
+
+  // If a mock execution delay was configured, simulate a long-running process.
+  if (mock_decode_delay_ > absl::ZeroDuration()) {
+    absl::Time start = absl::Now();
+    // Instead of sleeping for the entire duration at once, sleep in 10ms
+    // intervals so we can periodically poll the cancellation token.
+    while (absl::Now() - start < mock_decode_delay_) {
+      // Check if the cancellation flag has been set to true by the test thread.
+      if (cancelled->load()) {
+        // Abort early and return a cancelled error, simulating early stop.
+        return absl::CancelledError("Fake executor cancelled during delay");
+      }
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  // If not cancelled, proceed to call the base class implementation to generate
+  // tokens.
+  return FakeLlmExecutor::Decode(decode_params);
 }
 
 }  // namespace litert::lm

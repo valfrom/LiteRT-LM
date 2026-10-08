@@ -29,6 +29,7 @@ cc_library(
     deps = [
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -55,6 +56,7 @@ cc_library(
     hdrs = ["fc_tool_format_utils.h"],
     deps = [
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -96,6 +98,7 @@ cc_test(
     deps = [
         ":parser_common",
         "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/strings",
         "@nlohmann_json//:json",
         "//runtime/components/tool_use/rust:parsers_cpp",
     ],
@@ -180,6 +183,7 @@ cc_test(
         ":fc_parser_utils",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@nlohmann_json//:json",
         "//runtime/util:test_utils",
     ],

@@ -15,8 +15,6 @@
 #include "runtime/conversation/model_data_processor/gemma4_data_processor.h"
 
 #include <filesystem>  // NOLINT: Required for path manipulation.
-#include <fstream>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,15 +26,18 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/model_data_processor.h"
+#include "runtime/conversation/model_data_processor/test_utils.h"
+#include "runtime/conversation/prompt_utils.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/test_utils.h"  // NOLINT
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
@@ -45,40 +46,6 @@ using json = nlohmann::ordered_json;
 using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::status::IsOkAndHolds;
-
-constexpr char kTestdataDir[] =
-    "litert_lm/runtime/components/testdata/";
-
-constexpr char kImageTestdataDir[] =
-    "litert_lm/runtime/components/preprocessor/testdata/";
-
-std::string GetTestdataPath(const std::string& file_name) {
-  return (std::filesystem::path(::testing::SrcDir()) / kTestdataDir / file_name)
-      .string();
-}
-
-absl::StatusOr<std::string> GetContents(const std::string& path) {
-  std::ifstream input_stream(path);
-  if (!input_stream.is_open()) {
-    return absl::InternalError(absl::StrCat("Could not open file: ", path));
-  }
-
-  std::string content;
-  content.assign((std::istreambuf_iterator<char>(input_stream)),
-                 (std::istreambuf_iterator<char>()));
-  return std::move(content);
-}
-
-MATCHER_P(HasInputText, text_input, "") {
-  if (!std::holds_alternative<InputText>(arg)) {
-    return false;
-  }
-  auto text_bytes = std::get<InputText>(arg).GetRawTextString();
-  if (!text_bytes.ok()) {
-    return false;
-  }
-  return text_bytes.value() == text_input->GetRawTextString().value();
-}
 
 // Checks that the image tensor map has the expected keys and that the image
 // tensor has at most `max_num_patches` patches.
@@ -107,12 +74,23 @@ MATCHER_P(HasInputImage, max_num_patches, "") {
   return true;
 }
 
-MATCHER(HasInputImageEnd, "") {
-  if (!std::holds_alternative<InputImageEnd>(arg)) {
-    return false;
+class FakeNonSentencePieceTokenizer : public ::litert::support::Tokenizer {
+ public:
+  ::litert::support::TokenizerType GetTokenizerType() const override {
+    return ::litert::support::TokenizerType::kHuggingFace;
   }
-  return true;
-}
+  absl::StatusOr<std::vector<int>> TextToTokenIds(
+      absl::string_view text) override {
+    return std::vector<int>{};
+  }
+  absl::StatusOr<int> TokenToId(absl::string_view token) override { return 0; }
+  absl::StatusOr<std::string> TokenIdsToText(
+      absl::Span<const int> token_ids, bool skip_special_tokens) override {
+    return "";
+  }
+  std::vector<std::string> GetTokens() const override { return {}; }
+  int GetVocabSize() const override { return 0; }
+};
 
 class Gemma4DataProcessorTest : public ::testing::Test {
  protected:
@@ -125,6 +103,10 @@ class Gemma4DataProcessorTest : public ::testing::Test {
 
   std::unique_ptr<Tokenizer> tokenizer_;
 };
+
+class Gemma4DataProcessorImageTest
+    : public Gemma4DataProcessorTest,
+      public ::testing::WithParamInterface<std::string> {};
 
 TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextOnly) {
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
@@ -142,16 +124,15 @@ TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextOnly) {
   EXPECT_THAT(input_data, ElementsAre(HasInputText(&expected_text)));
 }
 
-TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextAndImage) {
+TEST_P(Gemma4DataProcessorImageTest, ToInputDataVectorTextAndImage) {
+  std::string image_name = GetParam();
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(
                                            /*Gemma4DataProcessorConfig=*/
                                            {.max_num_patches = 2520}));
   const std::string rendered_template_prompt =
       "<|turn>user\nHere is an image of apples <|image|><turn|>";
 
-  std::string image_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kImageTestdataDir / "apple.png")
-                               .string();
+  std::string image_path = GetImageTestdataPath(image_name);
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -166,12 +147,10 @@ TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextAndImage) {
 
     InputText expected_text1(
         "<|turn>user\nHere is an image of apples <|image>");
-    InputText expected_text2("\n\n");
-    InputText expected_text3("<turn|>");
+    InputText expected_text2("<turn|>");
     EXPECT_THAT(input_data,
                 ElementsAre(HasInputText(&expected_text1), HasInputImage(2520),
-                            HasInputImageEnd(), HasInputText(&expected_text2),
-                            HasInputText(&expected_text3)));
+                            HasInputImageEnd(), HasInputText(&expected_text2)));
   }
 
   {
@@ -184,18 +163,16 @@ TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextAndImage) {
 
     InputText expected_text1(
         "<|turn>user\nHere is an image of apples <|image>");
-    InputText expected_text2("\n\n");
-    InputText expected_text3("<turn|>");
+    InputText expected_text2("<turn|>");
     EXPECT_THAT(input_data,
                 ElementsAre(HasInputText(&expected_text1), HasInputImage(900),
-                            HasInputImageEnd(), HasInputText(&expected_text2),
-                            HasInputText(&expected_text3)));
+                            HasInputImageEnd(), HasInputText(&expected_text2)));
   }
 
   {
     // Override the visual token budget to 300 at runtime, which is larger than
-    // the max_num_patches / 9 in the config. The visual token budget should be
-    // capped to max_num_patches / 9.
+    // the max_num_patches / 9 in the config. The visual token budget should
+    // overwrite max_num_patches.
     ASSERT_OK_AND_ASSIGN(
         const std::vector<InputData> input_data,
         processor->ToInputDataVector(
@@ -204,12 +181,10 @@ TEST_F(Gemma4DataProcessorTest, ToInputDataVectorTextAndImage) {
 
     InputText expected_text1(
         "<|turn>user\nHere is an image of apples <|image>");
-    InputText expected_text2("\n\n");
-    InputText expected_text3("<turn|>");
+    InputText expected_text2("<turn|>");
     EXPECT_THAT(input_data,
-                ElementsAre(HasInputText(&expected_text1), HasInputImage(2520),
-                            HasInputImageEnd(), HasInputText(&expected_text2),
-                            HasInputText(&expected_text3)));
+                ElementsAre(HasInputText(&expected_text1), HasInputImage(2700),
+                            HasInputImageEnd(), HasInputText(&expected_text2)));
   }
 }
 
@@ -286,17 +261,27 @@ TEST_F(Gemma4DataProcessorTest, ToMessageWithToolCalls) {
 }
 
 TEST_F(Gemma4DataProcessorTest, PromptTemplateToInputDataVectorTextOnly) {
-  const std::string test_file_path = GetTestdataPath("google-gemma-4.jinja");
+  const std::string test_file_path =
+      GetModelPath("gemma4/chat_template_e2b_e4b.jinja");
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
 
   const nlohmann::ordered_json messages = {
-      {{"role", "system"}, {"content", "Hello world!"}},
-      {{"role", "user"}, {"content", "How are you?"}},
+      {{"role", "system"},
+       {"content", nlohmann::ordered_json::array(
+                       {{{"type", "text"}, {"text", "Hello world!"}}})}},
+      {{"role", "user"},
+       {"content", nlohmann::ordered_json::array(
+                       {{{"type", "text"}, {"text", "How are you?"}}})}},
       {{"role", "assistant"},
-       {"content", "I am doing well, thanks for asking."}},
-      {{"role", "user"}, {"content", "What is the capital of France?"}},
+       {"content", nlohmann::ordered_json::array(
+                       {{{"type", "text"},
+                         {"text", "I am doing well, thanks for asking."}}})}},
+      {{"role", "user"},
+       {"content",
+        nlohmann::ordered_json::array(
+            {{{"type", "text"}, {"text", "What is the capital of France?"}}})}},
   };
   PromptTemplateInput template_input = {.messages = messages,
                                         .add_generation_prompt = true};
@@ -322,9 +307,7 @@ What is the capital of France?<turn|>
 }
 
 TEST_F(Gemma4DataProcessorTest, FormatTools) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
   nlohmann::ordered_json tools = nlohmann::ordered_json::parse(R"json([
     {
       "name": "get_weather",
@@ -354,60 +337,8 @@ TEST_F(Gemma4DataProcessorTest, FormatTools) {
     }
   ])json");
 
-  ASSERT_OK_AND_ASSIGN(const nlohmann::ordered_json formatted_tools,
-                       processor->FormatTools(tools));
-
-  nlohmann::ordered_json expected = {
-      ("declaration:get_weather{"
-       "description:<|\"|>Gets weather information.<|\"|>,"
-       "parameters:{"
-       "properties:{"
-       "location:{"
-       "type:<|\"|>STRING<|\"|>,"
-       "description:<|\"|>Weather location.<|\"|>"
-       "}"   // location
-       "},"  // properties
-       "required:[<|\"|>location<|\"|>]"
-       "}"  // parameters
-       "}"  // declaration
-       ),
-      ("declaration:get_stock_price{"
-       "description:<|\"|>Gets stock price.<|\"|>,"
-       "parameters:{"
-       "properties:{"
-       "symbol:{"
-       "type:<|\"|>STRING<|\"|>,"
-       "description:<|\"|>Stock symbol.<|\"|>"
-       "}"   // symbol
-       "},"  // properties
-       "required:[<|\"|>symbol<|\"|>]"
-       "}"  // parameters
-       "}"  // declaration
-       )};
-  EXPECT_EQ(formatted_tools, expected);
-}
-
-TEST_F(Gemma4DataProcessorTest, FormatToolsWithInvalidInput) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  // `tools` is not an array.
-  nlohmann::ordered_json tools = nlohmann::ordered_json::parse(R"json({
-    "name": "get_weather",
-    "description": "Gets weather information.",
-    "parameters": {
-      "properties": {
-        "location": {
-          "type": "string",
-          "description": "Weather location."
-        }
-      },
-      "required": ["location"]
-    }
-  })json");
-
-  EXPECT_THAT(processor->FormatTools(tools),
-              testing::status::StatusIs(absl::StatusCode::kInvalidArgument));
+  // Tools should be passed through unchanged to the template.
+  EXPECT_THAT(processor->FormatTools(tools), IsOkAndHolds(tools));
 }
 
 TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithStringContent) {
@@ -417,10 +348,11 @@ TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithStringContent) {
       {"content", "test prompt"},
   };
 
-  // The template input is identical to the original message if the content is a
-  // string.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(message));
+              IsOkAndHolds(nlohmann::ordered_json({
+                  {"role", "user"},
+                  {"content", {{{"type", "text"}, {"text", "test prompt"}}}},
+              })));
 }
 
 TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithTextContent) {
@@ -448,9 +380,7 @@ TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputNoContent) {
 }
 
 TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolCalls) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
   const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
     "role": "assistant",
     "content": [
@@ -481,43 +411,13 @@ TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolCalls) {
     ]
   })json");
 
+  // Message with tool calls should be passed through unchanged to the template.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-    "role": "assistant",
-    "content": [
-      {
-        "type": "text",
-        "text": "This is some text."
-      }
-    ],
-    "tool_calls": [
-      {
-        "type": "function",
-        "function": {
-          "name": "tool1",
-          "arguments": {
-            "x": "1"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "tool2",
-          "arguments": {
-            "y": "<|\"|>foo<|\"|>"
-          }
-        }
-      }
-    ]
-  })json")));
+              IsOkAndHolds(message));
 }
 
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponsesNameAndValue) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolResponses) {
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
   const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": [
@@ -544,293 +444,13 @@ TEST_F(Gemma4DataProcessorTest,
     ]
   })json");
 
-  // The tool responses should be formatted as text items with the tool name
-  // and value converted to FC format.
+  // Tool responses should be passed through unchanged to the template.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{key1:<|\"|>value1<|\"|>,key2:<|\"|>value2<|\"|>}"
-                  },
-                  {
-                    "type": "text",
-                    "text": "tool_2{key3:<|\"|>value3<|\"|>,key4:<|\"|>value4<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponseToolNameAndValue) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "tool_name": "tool_1",
-          "value": {
-            "key1": "value1"
-          }
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{key1:<|\"|>value1<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponseNameAndArgs) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "name": "tool_1",
-          "key1": "value1"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{key1:<|\"|>value1<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponsesToolNameAndArgs) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "tool_name": "tool_1",
-          "key1": "value1"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{key1:<|\"|>value1<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponseWithNonObjectValue) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "name": "tool_1",
-          "value": "foo"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{value:<|\"|>foo<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolResponseWithNonObjectResponse) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "name": "tool_1",
-          "response": "foo"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{response:<|\"|>foo<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolResponsesNoName) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "type": "tool_response",
-        "tool_response": {
-          "key1": "value1"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "{key1:<|\"|>value1<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolContentAsObject) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": {
-      "name": "get_weather",
-      "temperature": 72,
-      "units": "Fahrenheit"
-    }
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": "get_weather{temperature:72,units:<|\"|>Fahrenheit<|\"|>}"
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolContentAsObjectWithNameAndResponse) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": {
-      "name": "tool_1",
-      "response": {
-        "key1": "value1"
-      }
-    }
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": "tool_1{key1:<|\"|>value1<|\"|>}"
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest,
-       MessageToTemplateInputWithToolContentAsArrayWithNameAndResponse) {
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = false;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": [
-      {
-        "name": "tool_1",
-        "response": {
-          "key1": "value1"
-        }
-      }
-    ]
-  })json");
-
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": [
-                  {
-                    "type": "text",
-                    "text": "tool_1{key1:<|\"|>value1<|\"|>}"
-                  }
-                ]
-              })json")));
-}
-
-TEST_F(Gemma4DataProcessorTest, MessageToTemplateInputWithToolContentAsString) {
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
-  const nlohmann::ordered_json message = nlohmann::ordered_json::parse(R"json({
-    "role": "tool",
-    "content": "get_weather{temperature:72,units:<|\"|>Fahrenheit<|\"|>}"
-  })json");
-
-  // String content should be kept as is.
-  EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
-                "role": "tool",
-                "content": "get_weather{temperature:72,units:<|\"|>Fahrenheit<|\"|>}"
-              })json")));
+              IsOkAndHolds(message));
 }
 
 struct RenderTemplateTestCase {
   std::string jinja_template_file;
-  bool use_template_for_fc_format;
 };
 
 class Gemma4RenderTemplateTest
@@ -842,7 +462,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateUserTurn) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -861,9 +481,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateUserTurn) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -892,7 +510,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateAssistantTurnTextOnly) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -920,9 +538,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateAssistantTurnTextOnly) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -952,7 +568,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolDeclarations) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -999,14 +615,17 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolDeclarations) {
   nlohmann::ordered_json messages = nlohmann::ordered_json::parse(R"json([
     {
       "role": "user",
-      "content": "How is the weather in Paris and London?"
+      "content": [
+        {
+          "type": "text",
+          "text": "How is the weather in Paris and London?"
+        }
+      ]
     }
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Format the tools.
   ASSERT_OK_AND_ASSIGN(nlohmann::ordered_json formatted_tools,
@@ -1022,7 +641,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolDeclarations) {
   // Compare to the expected prompt.
   EXPECT_THAT(
       rendered_prompt,
-      Eq("<|turn>system\n\n\n"
+      Eq("<|turn>system\n"
          "<|tool>declaration:get_weather{description:<|\"|>Gets weather "
          "information.<|\"|>,parameters:{properties:{location:{description:<|"
          "\"|>Weather "
@@ -1041,7 +660,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolCalls) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -1083,9 +702,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolCalls) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -1112,8 +729,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolCalls) {
       "How is the weather in Paris and London?<turn|>\n"
       "<|turn>model\n"
       "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_call|>"
-      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|><"
-      "turn|>\n");
+      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|>");
 }
 
 TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolResponses) {
@@ -1121,7 +737,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolResponses) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -1186,9 +802,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolResponses) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -1215,8 +829,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithToolResponses) {
       "How is the weather in Paris and London?<turn|>\n"
       "<|turn>model\n"
       "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_call|>"
-      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|><"
-      "turn|>\n"
+      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|>"
       "<|tool_response>response:get_weather{location:<|\"|>Paris<|\"|>,"
       "temperature:20,unit:<|\"|>C<|\"|>,weather:<|\"|>Sunny<|\"|>}<tool_"
       "response|>"
@@ -1230,7 +843,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithMultipleToolMessages) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -1296,9 +909,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithMultipleToolMessages) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -1325,11 +936,13 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithMultipleToolMessages) {
       "How is the weather in Paris and London?<turn|>\n"
       "<|turn>model\n"
       "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_call|>"
-      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|><"
-      "turn|>\n"
-      "<turn|>\n"
-      "<turn|>\n"
-      "<|turn>model\n");
+      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|>"
+      "<|tool_response>response:get_weather{location:<|\"|>Paris<|\"|>,"
+      "temperature:20,unit:<|\"|>C<|\"|>,weather:<|\"|>Sunny<|\"|>}<tool_"
+      "response|>"
+      "<|tool_response>response:get_weather{location:<|\"|>London<|\"|>,"
+      "temperature:15,unit:<|\"|>C<|\"|>,weather:<|\"|>Cloudy<|\"|>}<tool_"
+      "response|>");
 }
 
 TEST_P(Gemma4RenderTemplateTest,
@@ -1338,7 +951,7 @@ TEST_P(Gemma4RenderTemplateTest,
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -1412,9 +1025,7 @@ TEST_P(Gemma4RenderTemplateTest,
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -1438,15 +1049,13 @@ TEST_P(Gemma4RenderTemplateTest,
       "How is the weather in Paris and London?<turn|>\n"
       "<|turn>model\n"
       "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_call|>"
-      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|><"
-      "turn|>\n"
+      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|>"
       "<|tool_response>response:get_weather{location:<|\"|>Paris<|\"|>,"
       "temperature:20,unit:<|\"|>C<|\"|>,weather:<|\"|>Sunny<|\"|>}<tool_"
       "response|>"
       "<|tool_response>response:get_weather{location:<|\"|>London<|\"|>,"
       "temperature:15,unit:<|\"|>C<|\"|>,weather:<|\"|>Cloudy<|\"|>}<tool_"
       "response|>"
-      "<|turn>model\n"
       "The weather in Paris is sunny and the weather in London is "
       "cloudy.<turn|>\n");
 }
@@ -1456,7 +1065,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithEmptyAssistantMessage) {
 
   // Load the prompt template.
   const std::string test_file_path =
-      GetTestdataPath(test_case.jinja_template_file);
+      GetModelPath(test_case.jinja_template_file);
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
@@ -1515,9 +1124,7 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithEmptyAssistantMessage) {
   ])json");
 
   // Create the model data processor.
-  Gemma4DataProcessorConfig config;
-  config.use_template_for_fc_format = test_case.use_template_for_fc_format;
-  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create(config));
+  ASSERT_OK_AND_ASSIGN(auto processor, Gemma4DataProcessor::Create());
 
   // Convert the messages to template inputs.
   nlohmann::ordered_json message_template_input =
@@ -1535,26 +1142,30 @@ TEST_P(Gemma4RenderTemplateTest, RenderTemplateWithEmptyAssistantMessage) {
                        prompt_template.Apply(template_input));
 
   // Compare to the expected prompt.
-  EXPECT_EQ(rendered_prompt,
-            "<|turn>user\n"
-            "How is the weather in Paris?<turn|>\n"
-            "<|turn>model\n"
-            "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_"
-            "call|><turn|>\n"
-            "<|tool_response>response:get_weather{location:<|\"|>Paris<|\"|>,"
-            "temperature:20,unit:<|\"|>C<|\"|>,weather:<|\"|>Sunny<|\"|>}<tool_"
-            "response|><|turn>model\n"
-            "<turn|>\n"
-            "<|turn>user\n"
-            "How is the weather in New York?<turn|>\n"
-            "<|turn>model\n");
+  EXPECT_EQ(
+      rendered_prompt,
+      "<|turn>user\n"
+      "How is the weather in Paris?<turn|>\n"
+      "<|turn>model\n"
+      "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_"
+      "call|><|tool_response>response:get_weather{location:<|\"|>Paris<|\"|>,"
+      "temperature:20,unit:<|\"|>C<|\"|>,weather:<|\"|>Sunny<|\"|>}<tool_"
+      "response|><turn|>\n"
+      "<|turn>user\n"
+      "How is the weather in New York?<turn|>\n"
+      "<|turn>model\n");
 }
 
-INSTANTIATE_TEST_SUITE_P(FcFormatCodeOrTemplate, Gemma4RenderTemplateTest,
-                         testing::ValuesIn<RenderTemplateTestCase>({
-                             {.jinja_template_file = "google-gemma-4.jinja",
-                              .use_template_for_fc_format = true},
-                         }));
+INSTANTIATE_TEST_SUITE_P(
+    FcFormatCodeOrTemplate, Gemma4RenderTemplateTest,
+    testing::ValuesIn<RenderTemplateTestCase>({
+        {.jinja_template_file = "gemma4/chat_template_e2b_e4b.jinja"},
+    }));
 
 }  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Gemma4DataProcessorImageTests,
+                         Gemma4DataProcessorImageTest,
+                         ::testing::Values("apple.bmp", "apple.png"));
+
 }  // namespace litert::lm

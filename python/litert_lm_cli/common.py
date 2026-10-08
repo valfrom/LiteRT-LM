@@ -14,38 +14,89 @@
 
 """Shared options and helper functions for LiteRT-LM CLI."""
 
+import collections.abc
+import http.client
+import pathlib
+import tempfile
 import textwrap
+
 import click
 
+from litert_lm_cli import config
 
-def parse_speculative_decoding(unused_ctx, unused_param, value):
-  """Click callback to parse speculative decoding mode strings into bool | None.
+
+def parse_config_opt(unused_ctx, unused_param, value):
+  """Click callback for --config option to set the custom config path."""
+  if value is not None:
+    config.set_config_path(value)
+  return value
+
+
+def config_option(f):
+  """Decorator for the --config option."""
+  f = click.option(
+      "--config",
+      type=click.Path(exists=True, dir_okay=False, path_type=str),
+      default=None,
+      callback=parse_config_opt,
+      is_eager=True,
+      expose_value=False,
+      help=(
+          "Path to a custom config.json file to use instead of the default"
+          " ~/.litert-lm/config.json."
+      ),
+  )(f)
+  return f
+
+
+def parse_bool_opt(unused_ctx, unused_param, value):
+  """Click callback to parse boolean option strings into bool | None.
 
   Args:
     unused_ctx: The click context.
     unused_param: The click parameter.
-    value: The value to parse ("auto", "true", or "false").
+    value: The value to parse ("true" or "false").
 
   Returns:
-    True for "true", False for "false", and None for "auto".
+    True for "true", False for "false", and None if not set.
   """
   if value is None:
     return None
-  value_lower = value.lower()
-  if value_lower == "auto":
-    return None
-  elif value_lower == "true":
+  if isinstance(value, bool):
+    return value
+  value_lower = str(value).lower()
+  if value_lower == "true":
     return True
   elif value_lower == "false":
     return False
   return value
 
 
-def cache_dir_value_from_cache_mode(cache: str) -> str:
+def parse_deprecated_speculative_decoding(unused_ctx, unused_param, value):
+  """Click callback for deprecated --enable-speculative-decoding option."""
+  if value is not None and (
+      unused_ctx is None or not unused_ctx.resilient_parsing
+  ):
+    click.echo(
+        click.style(
+            "Warning: '--enable-speculative-decoding' is deprecated and will"
+            " be removed in the future. Please use '--speculative-decoding'"
+            " instead.",
+            fg="yellow",
+        ),
+        err=True,
+    )
+  return parse_bool_opt(unused_ctx, unused_param, value)
+
+
+parse_speculative_decoding = parse_bool_opt
+
+
+def cache_dir_value_from_cache_mode(cache: str | None) -> str:
   """Returns the cache directory value for the given cache mode.
 
   Args:
-    cache: The cache mode. Valid values are "disk", "memory", "no".
+    cache: The cache mode. Valid values are "disk", "memory", "no", or None.
 
   Returns:
     The cache directory value as a string.
@@ -53,6 +104,8 @@ def cache_dir_value_from_cache_mode(cache: str) -> str:
   Raises:
     ValueError: If the cache mode is invalid.
   """
+  if cache is None:
+    return ""
   if cache == "disk":
     return ""
   elif cache == "memory":
@@ -68,11 +121,11 @@ def huggingface_options(f):
   f = click.option(
       "--huggingface-token",
       default=None,
+      envvar="HF_TOKEN",
       help=(
-          "The HuggingFace API token to use when downloading from a access"
-          " gated HuggingFace repository. This can also be set via the"
-          " HUGGING_FACE_HUB_TOKEN or HF_TOKEN environment variables, or by"
-          " running `hf auth login`."
+          "The HuggingFace API token to use when downloading from an"
+          " access-gated HuggingFace repository. This can also be set via the"
+          " HF_TOKEN environment variable."
       ),
   )(f)
   f = click.option(
@@ -85,6 +138,7 @@ def huggingface_options(f):
 
 def common_inference_options(f):
   """Decorator for common options shared across commands."""
+  f = config_option(f)
   f = huggingface_options(f)
   f = click.option(
       "--verbose",
@@ -95,10 +149,11 @@ def common_inference_options(f):
   f = click.option(
       "--cache",
       type=click.Choice(["disk", "memory", "no"]),
-      default="disk",
+      default=None,
       help=textwrap.dedent("""\
           \b
-          Caching mode for compiled model artifacts to speed up startup.
+          Caching mode for compiled model artifacts to speed up startup. If not
+          set, use the model's configured value.
             - disk: Persists compiled artifacts to a file next to the model.
             - memory: Caches compiled artifacts in RAM (CPU backend only, not available on Windows).
             - no: Disables caching (recompiles on every run).
@@ -106,73 +161,189 @@ def common_inference_options(f):
   )(f)
   f = click.option(
       "--enable-speculative-decoding",
-      type=click.Choice(["auto", "true", "false"], case_sensitive=False),
-      default="auto",
-      callback=parse_speculative_decoding,
+      type=click.Choice(["true", "false"], case_sensitive=False),
+      default=None,
+      deprecated=True,
+      hidden=True,
+      callback=parse_deprecated_speculative_decoding,
       help=textwrap.dedent("""\
           \b
-          Speculative decoding mode ("auto", "true", "false").
-            - auto: Automatically determine the speculative decoding behavior from the model metadata.
+          Speculative decoding mode ("true", "false"). If not set, use the model's configured value.
             - true: Force enable speculative decoding. It will throw an error if the model does not support it.
             - false: Force disable speculative decoding.
           """),
   )(f)
   f = click.option(
+      "--speculative-decoding",
+      is_flag=False,
+      flag_value="true",
+      type=click.Choice(["true", "false"], case_sensitive=False),
+      default=None,
+      callback=parse_speculative_decoding,
+      help=textwrap.dedent("""\
+          \b
+          Speculative decoding mode ("true", "false"). If not set, use the model's configured value.
+            - true: Force enable speculative decoding. It will throw an error if the model does not support it.
+            - false: Force disable speculative decoding.
+          """),
+  )(f)
+
+  f = click.option(
       "--backend",
       type=click.Choice(["cpu", "gpu", "npu"], case_sensitive=False),
-      default="cpu",
-      help="The backend to use.",
+      default=None,
+      help="The backend to use. If not set, use the model's configured value.",
+  )(f)
+  f = click.option(
+      "--cpu-thread-count",
+      type=click.IntRange(min=1),
+      default=None,
+      help=(
+          "The number of threads to use for the CPU backend. Only takes effect"
+          " when the main 'backend' is 'cpu'."
+      ),
+  )(f)
+  f = click.option(
+      "--gpu-decode-steps-per-sync",
+      type=click.IntRange(min=1),
+      default=None,
+      help=(
+          "The number of decode steps per sync for GPU backend. Only applied"
+          " to supported GPU models. Otherwise, ignored."
+      ),
+  )(f)
+  f = click.option(
+      "--activation-data-type",
+      type=click.Choice(
+          ["fp32", "fp16", "int16", "int8"], case_sensitive=False
+      ),
+      default=None,
+      hidden=True,
+      help=(
+          "The activation data type to use for inference. If not set, use the"
+          " default from the engine. Note: This option is experimental and may"
+          " not always work.  Currently, it can be used to force FP32 mode when"
+          " using a GPU backend."
+      ),
+  )(f)
+  f = click.option(
+      "--ringbuffers-local-attention",
+      is_flag=False,
+      flag_value="true",
+      type=click.Choice(["true", "false"], case_sensitive=False),
+      default=None,
+      callback=parse_bool_opt,
+      help=(
+          "Whether to use ringbuffers for local attention KV cache to minimize"
+          " memory usage on supported models. When disabled, memory is"
+          " allocated for the full context length, enabling instant rewinding"
+          " at higher memory cost."
+      ),
+  )(f)
+  f = click.option(
+      "--enable-ynnpack",
+      is_flag=False,
+      flag_value="true",
+      type=click.Choice(["true", "false"], case_sensitive=False),
+      default=None,
+      callback=parse_bool_opt,
+      hidden=True,
+      help="Delegate supported CPU operations to YNNPACK before XNNPACK.",
   )(f)
   return f
 
 
-def download_from_huggingface(repo_id, filename, token):
-  """Downloads a file from HuggingFace Hub.
+_DOWNLOAD_CHUNK_SIZE = 1024 * 64
+
+
+def _size_string_from_bytes(size_in_bytes: int) -> str:
+  """Formats bytes to a human-readable string (e.g., 18.2GiB)."""
+  size = float(size_in_bytes)
+  for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+    if size < 1024.0:
+      if unit == "B":
+        return f"{int(size)}{unit}"
+      return f"{size:.1f}{unit}"
+    size /= 1024.0
+  return f"{size:.1f}PiB"
+
+
+def stream_download(
+    response: http.client.HTTPResponse,
+    *,
+    download_dir: pathlib.Path,
+    length: int | None,
+    format_progress: collections.abc.Callable[[int], str],
+) -> pathlib.Path:
+  """Streams the download response body to a temporary file.
+
+  If any exception occurs during the download or file writing, the temporary
+  file is guaranteed to be cleaned up.
 
   Args:
-    repo_id: The HuggingFace repository ID.
-    filename: The filename to download.
-    token: The HuggingFace API token.
+    response: The HTTPResponse object to read the body from.
+    download_dir: The directory where the temporary file should be created.
+    length: The expected length of the download in bytes, if known.
+    format_progress: A callable returning the formatted progress string.
 
   Returns:
-    The local path to the downloaded file, or None if download failed.
+    The path to the temporary file where the response body was written.
   """
+  download_dir.mkdir(parents=True, exist_ok=True)
+  tmp_file = tempfile.NamedTemporaryFile(dir=download_dir, delete=False)
+  tmp_file_path = pathlib.Path(tmp_file.name)
   try:
-    # pylint: disable=g-import-not-at-top
-    from huggingface_hub import get_token  # pytype: disable=import-error
-    from huggingface_hub import hf_hub_download  # pytype: disable=import-error
-  except ImportError:
-    click.echo(
-        click.style(
-            "Error: huggingface_hub is not installed. Please install it to"
-            " download from HuggingFace.",
-            fg="red",
-        )
-    )
+    with tmp_file:
+      with click.progressbar(
+          length=length,
+          show_pos=False,
+          show_percent=False,
+          show_eta=False,
+          item_show_func=lambda item: item,
+          bar_template="[%(bar)s]  %(info)s",
+          width=20,
+      ) as bar:
+        current_pos = 0
+        for chunk in iter(lambda: response.read(_DOWNLOAD_CHUNK_SIZE), b""):
+          tmp_file.write(chunk)
+          current_pos += len(chunk)
+          bar.update(len(chunk), current_item=format_progress(current_pos))
+  except Exception:
+    try:
+      tmp_file_path.unlink(missing_ok=True)
+    except OSError:
+      pass
+    raise
+  else:
+    return tmp_file_path
+
+
+def parse_total_size(content_length: str | None) -> int | None:
+  """Parses the Content-Length header value into an integer."""
+  if content_length is None:
+    return None
+  try:
+    return int(content_length)
+  except ValueError:
     return None
 
-  effective_token = token or get_token()
 
-  click.echo(f"Downloading {filename} from {repo_id}...")
-  try:
-    return hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        token=effective_token,
-    )
-  except Exception as e:  # pylint: disable=broad-exception-caught
-    click.echo(
-        click.style(f"Error downloading from HuggingFace: {e}", fg="red")
-    )
-    if not effective_token:
-      click.echo(
-          click.style(
-              "HuggingFace token not found. If this is a private or gated"
-              " repository, you can provide the token via the"
-              " --huggingface-token option, setting the"
-              " HUGGING_FACE_HUB_TOKEN environment variable, or by running"
-              " 'hf auth login'.",
-              fg="yellow",
-          )
-      )
-    return None
+def download_size_suffix(total_size: int | None) -> str:
+  """Generates a formatted size suffix string for download logs."""
+  return (
+      f" ({_size_string_from_bytes(total_size)})"
+      if total_size is not None
+      else ""
+  )
+
+
+def format_download_progress(
+    current_pos_bytes: int, total_size: int | None
+) -> str:
+  """Formats the download progress into a human-readable string."""
+  if total_size is not None and total_size > 0:
+    pct = int((current_pos_bytes / total_size) * 100)
+    return f"{pct}%"
+  if current_pos_bytes > 1_048_576:
+    return f"{current_pos_bytes / 1_048_576:.1f} MiB"
+  return f"{current_pos_bytes / 1024:.1f} KiB"

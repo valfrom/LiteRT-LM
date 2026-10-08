@@ -54,9 +54,16 @@ std::string EditTemplateForMinijinja(absl::string_view template_content) {
                      R"( | split(\1))");
   RE2::GlobalReplace(&modified_template, R"regex(\.join\((.*?)\))regex",
                      R"( | join(\1))");
-  RE2::GlobalReplace(&modified_template, R"regex(\.[l,r]strip\(\))regex",
-                     " | trim");
-  RE2::GlobalReplace(&modified_template, R"regex(\.[l,r]strip\((.*?)\))regex",
+  RE2::GlobalReplace(&modified_template, R"regex(\.lstrip\(\))regex",
+                     " | lstrip");
+  RE2::GlobalReplace(&modified_template, R"regex(\.lstrip\((.*?)\))regex",
+                     R"( | lstrip(\1))");
+  RE2::GlobalReplace(&modified_template, R"regex(\.rstrip\(\))regex",
+                     " | rstrip");
+  RE2::GlobalReplace(&modified_template, R"regex(\.rstrip\((.*?)\))regex",
+                     R"( | rstrip(\1))");
+  RE2::GlobalReplace(&modified_template, R"regex(\.strip\(\))regex", " | trim");
+  RE2::GlobalReplace(&modified_template, R"regex(\.strip\((.*?)\))regex",
                      R"( | trim(\1))");
   RE2::GlobalReplace(&modified_template, R"regex(\.items\(\))regex",
                      " | items");
@@ -70,20 +77,11 @@ std::string EditTemplateForMinijinja(absl::string_view template_content) {
 
 using json = nlohmann::ordered_json;
 
-PromptTemplate::PromptTemplate(absl::string_view template_content,
-                               bool edit_template_for_minijinja)
-    : minijinja_template_(new_minijinja_template(
-          edit_template_for_minijinja
-              ? EditTemplateForMinijinja(template_content)
-              : std::string(template_content))) {
+PromptTemplate::PromptTemplate(absl::string_view template_content)
+    : minijinja_template_(
+          new_minijinja_template(EditTemplateForMinijinja(template_content))) {
   const auto caps = minijinja_template_->get_capabilities();
   capabilities_ = PromptTemplateCapabilities{
-      .supports_tools = caps.supports_tools,
-      .supports_tool_calls = caps.supports_tool_calls,
-      .supports_system_role = caps.supports_system_role,
-      .supports_parallel_tool_calls = caps.supports_parallel_tool_calls,
-      .supports_tool_call_id = caps.supports_tool_call_id,
-      .requires_typed_content = caps.requires_typed_content,
       .supports_single_turn = caps.supports_single_turn};
 }
 

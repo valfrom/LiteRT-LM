@@ -20,12 +20,6 @@ use serde_json::{json, Value};
 mod ffi {
     #[derive(Clone, Copy, Default)]
     struct ChatTemplateCapabilities {
-        supports_tools: bool,
-        supports_tool_calls: bool,
-        supports_system_role: bool,
-        supports_parallel_tool_calls: bool,
-        supports_tool_call_id: bool,
-        requires_typed_content: bool,
         supports_single_turn: bool,
     }
 
@@ -73,66 +67,9 @@ pub struct MinijinjaTemplate {
 }
 
 fn detect_capabilities(source: &str) -> ffi::ChatTemplateCapabilities {
-    let mut caps = ffi::ChatTemplateCapabilities::default();
-    let mut env = Environment::new();
-    env.set_keep_trailing_newline(false);
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
-
-    if let Ok(tmpl) = env.template_from_str(source) {
-        let undeclared = tmpl.undeclared_variables(true);
-        if undeclared.contains("tools") {
-            caps.supports_tools = true;
-        }
-
-        let test_content = "test content";
-        let test_str_user_msg = json!({ "role": "user", "content": test_content });
-        let test_typed_user_msg = json!({
-            "role": "user",
-            "content": [{ "type": "text", "text": test_content }]
-        });
-
-        let try_render = |msg: Value| -> bool {
-            let ctx = json!({
-                "messages": [msg],
-                "add_generation_prompt": false,
-                "tools": [],
-                "extra_context": {}
-            });
-            tmpl.render(ctx).map(|s| s.contains(test_content)).unwrap_or(false)
-        };
-
-        let str_works = try_render(test_str_user_msg);
-        let typed_works = try_render(test_typed_user_msg);
-
-        if !str_works && typed_works {
-            caps.requires_typed_content = true;
-        }
+    ffi::ChatTemplateCapabilities {
+        supports_single_turn: source.contains("is_appending_to_prefill"),
     }
-
-    if source.contains("tool_calls") {
-        caps.supports_tool_calls = true;
-    }
-    if source.contains("tool_call_id") {
-        caps.supports_tool_call_id = true;
-    }
-    if !caps.supports_tools && source.contains("tools") {
-        caps.supports_tools = true;
-    }
-
-    if source.contains("system") {
-        caps.supports_system_role = true;
-    }
-
-    if caps.supports_tool_calls && source.contains("for") && source.contains("tool_calls") {
-        caps.supports_parallel_tool_calls = true;
-    }
-
-    if source.contains("is_appending_to_prefill") {
-        caps.supports_single_turn = true;
-    }
-
-    caps
 }
 
 fn new_minijinja_template(source: String) -> Box<MinijinjaTemplate> {
@@ -217,6 +154,43 @@ fn is_none(value: minijinja::Value) -> bool {
     value.is_undefined()
 }
 
+fn lstrip(s: std::borrow::Cow<'_, str>, chars: Option<std::borrow::Cow<'_, str>>) -> String {
+    match chars {
+        Some(chars) => {
+            let chars = chars.chars().collect::<Vec<_>>();
+            s.trim_start_matches(&chars[..]).to_string()
+        }
+        None => s.trim_start().to_string(),
+    }
+}
+
+fn rstrip(s: std::borrow::Cow<'_, str>, chars: Option<std::borrow::Cow<'_, str>>) -> String {
+    match chars {
+        Some(chars) => {
+            let chars = chars.chars().collect::<Vec<_>>();
+            s.trim_end_matches(&chars[..]).to_string()
+        }
+        None => s.trim_end().to_string(),
+    }
+}
+
+fn create_env() -> Environment<'static> {
+    let mut env = Environment::new();
+    // Keep trailing newlines in the rendered prompt text (e.g., `<think>\n`
+    // when prefilling thinking channels) so that prompt specifications and
+    // model training formatting are preserved exactly without being stripped.
+    env.set_keep_trailing_newline(true);
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.add_function("strftime_now", strftime_now);
+    env.add_function("raise_exception", raise_exception);
+    env.add_filter("tojson", tojson);
+    env.add_filter("lstrip", lstrip);
+    env.add_filter("rstrip", rstrip);
+    env.add_test("none", is_none);
+    env
+}
+
 impl MinijinjaTemplate {
     fn apply(&self, inputs_json: String) -> ffi::ApplyResult {
         match self.apply_impl(inputs_json) {
@@ -254,14 +228,7 @@ impl MinijinjaTemplate {
             _ => vec![],
         };
 
-        let mut env = Environment::new();
-        env.set_keep_trailing_newline(false);
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.add_function("strftime_now", strftime_now);
-        env.add_function("raise_exception", raise_exception);
-        env.add_filter("tojson", tojson);
-        env.add_test("none", is_none);
+        let mut env = create_env();
         env.add_template("template", &self.source)?;
         let tmpl = env.get_template("template")?;
 
@@ -312,20 +279,6 @@ mod tests {
         let res = wrapper.apply(inputs.to_string());
         assert!(res.is_ok);
         assert_eq!(res.content, "Hello World");
-    }
-
-    #[test]
-    fn test_requires_typed_content() {
-        // Template that expects content to be a list of dicts.
-        let source_requires_typed_content = "{% for m in messages %}{% for block in m.content %}{{ block.text }}{% endfor %}{% endfor %}";
-        let wrapper_requires_typed_content =
-            new_minijinja_template(source_requires_typed_content.to_string());
-        assert!(wrapper_requires_typed_content.caps.requires_typed_content);
-
-        // Template that works with string content.
-        let source_any_content = "{{ messages[0].content }}";
-        let wrapper_any_content = new_minijinja_template(source_any_content.to_string());
-        assert!(!wrapper_any_content.caps.requires_typed_content);
     }
 
     #[test]
@@ -427,5 +380,20 @@ mod tests {
         let res = wrapper.apply(inputs.to_string());
         assert!(!res.is_ok);
         assert!(res.error.contains("Something went wrong"));
+    }
+
+    #[test]
+    fn test_lstrip_rstrip() {
+        let source = "  foo  |{{ '  bar  '|lstrip }}|{{ '  baz  '|rstrip }}|{{ '1212foo12'|lstrip('12') }}|{{ '12foo1212'|rstrip('12') }}";
+        let wrapper = new_minijinja_template(source.to_string());
+        let inputs = json!({
+            "messages": [],
+            "tools": null,
+            "add_generation_prompt": false,
+            "extra_context": {}
+        });
+        let res = wrapper.apply(inputs.to_string());
+        assert!(res.is_ok);
+        assert_eq!(res.content, "  foo  |bar  |  baz|foo12|12foo");
     }
 }

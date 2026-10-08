@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -21,15 +22,22 @@
 #include <gtest/gtest.h>
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
-#include "runtime/components/tokenizer.h"
-#include "runtime/util/test_utils.h"  // NOLINT
+#include "runtime/components/constrained_decoding/logit_mask.h"
+#include "runtime/util/test_utils.h"  // IWYU pragma: keep
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
+
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+using TokenIds = ::litert::support::TokenIds;
+
 namespace {
 
 using ::testing::Return;
@@ -40,9 +48,10 @@ class MockTokenizer : public Tokenizer {
   MOCK_METHOD(absl::StatusOr<TokenIds>, TextToTokenIds, (absl::string_view),
               (override));
   MOCK_METHOD(absl::StatusOr<int>, TokenToId, (absl::string_view), (override));
-  MOCK_METHOD(absl::StatusOr<std::string>, TokenIdsToText, (const TokenIds&),
-              (override));
+  MOCK_METHOD(absl::StatusOr<std::string>, TokenIdsToText,
+              (absl::Span<const int>, bool), (override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
+  MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
 class LlgConstraintTest : public ::testing::Test {
@@ -94,6 +103,31 @@ TEST_F(LlgConstraintTest, ComputeBitmap) {
 
   EXPECT_TRUE(bitmap->Get(2));   // a
   EXPECT_FALSE(bitmap->Get(3));  // b
+}
+
+TEST_F(LlgConstraintTest, ComputeMask) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<ConstraintProvider> provider,
+                       CreateProvider());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<Constraint> constraint,
+                       provider->CreateConstraint(LlGuidanceConstraintArg{
+                           .constraint_type = LlgConstraintType::kRegex,
+                           .constraint_string = "a+"}));
+
+  std::unique_ptr<Constraint::State> state = constraint->Start();
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<LogitMask> mask,
+                       constraint->ComputeMask(*state));
+
+  ASSERT_NE(mask, nullptr);
+  EXPECT_EQ(mask->GetType(), MaskType::kBitmap);
+  auto* bitmap_mask = static_cast<BitmapLogitMask*>(mask.get());
+  EXPECT_TRUE(bitmap_mask->IsAllowed(2));   // a
+  EXPECT_FALSE(bitmap_mask->IsAllowed(3));  // b
+
+  // Verify Apply on logits
+  std::vector<float> logits(5, 0.0f);
+  EXPECT_OK(mask->Apply(absl::MakeSpan(logits)));
+  EXPECT_EQ(logits[2], 0.0f);
+  EXPECT_TRUE(std::isinf(logits[3]) && logits[3] < 0.0f);
 }
 
 TEST_F(LlgConstraintTest, TransitionAndEnd) {

@@ -116,7 +116,7 @@ class ConstrainedDecoderTest : public ::testing::Test {
   int vocab_size_;
 };
 
-TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
+TEST_F(ConstrainedDecoderTest, UpdateStateAndProcessLogitsBatchSize1) {
   ASSERT_OK_AND_ASSIGN(
       auto constraint,
       provider_->CreateConstraint(FstConstraintArg{.constraint_string = "ab"}));
@@ -130,7 +130,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
       CreateTokenIdsTensorBuffer<int32_t>(env, token_ids, {1, 1}));
 
   // Update state with "a".
-  ASSERT_OK(constrained_decoder.UpdateConstraintState(tokens_id_tensor_buffer));
+  ASSERT_OK(constrained_decoder.UpdateState(tokens_id_tensor_buffer));
 
   // Create a tensor buffer for the logits with all values set to 2.0f.
   std::vector<float> logits_data(vocab_size_, 2.0f);
@@ -139,7 +139,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
       CreateTokenIdsTensorBuffer<float>(env, logits_data.data(),
                                         {1, 1, vocab_size_}));
 
-  ASSERT_OK(constrained_decoder.MaskLogits(logits_tensor_buffer));
+  ASSERT_OK(constrained_decoder.ProcessLogits(logits_tensor_buffer));
 
   // Verify that only the "b" token is allowed.
   LITERT_ASSERT_OK_AND_ASSIGN(
@@ -149,7 +149,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
     if (i == spm_processor_.PieceToId("b")) {
       EXPECT_EQ(masked_logits_span[i], 2.0f);
     } else {
-      EXPECT_EQ(masked_logits_span[i], std::numeric_limits<float>::lowest());
+      EXPECT_EQ(masked_logits_span[i], -std::numeric_limits<float>::infinity());
     }
   }
 
@@ -159,8 +159,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
       CreateTokenIdsTensorBuffer<int32_t>(env, new_token_ids, {1, 1}));
 
   // Update state with "b".
-  ASSERT_OK(
-      constrained_decoder.UpdateConstraintState(new_token_ids_tensor_buffer));
+  ASSERT_OK(constrained_decoder.UpdateState(new_token_ids_tensor_buffer));
 
   // Create a tensor buffer for the logits with all values set to 3.0f.
   std::vector<float> new_logits_data(vocab_size_, 3.0f);
@@ -170,7 +169,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
                                         {1, 1, vocab_size_}));
 
   // Update state with "b".
-  ASSERT_OK(constrained_decoder.MaskLogits(new_logits_tensor_buffer));
+  ASSERT_OK(constrained_decoder.ProcessLogits(new_logits_tensor_buffer));
 
   // Verify that only the "<e>" token is allowed.
   LITERT_ASSERT_OK_AND_ASSIGN(
@@ -181,12 +180,12 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize1) {
       EXPECT_EQ(new_masked_logits_span[i], 3.0f);
     } else {
       EXPECT_EQ(new_masked_logits_span[i],
-                std::numeric_limits<float>::lowest());
+                -std::numeric_limits<float>::infinity());
     }
   }
 }
 
-TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize2) {
+TEST_F(ConstrainedDecoderTest, UpdateStateAndProcessLogitsBatchSize2) {
   ASSERT_OK_AND_ASSIGN(auto constraint,
                        provider_->CreateConstraint(
                            FstConstraintArg{.constraint_string = "a|c"}));
@@ -201,7 +200,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize2) {
       CreateTokenIdsTensorBuffer<int32_t>(env, token_ids, {2, 1}));
 
   // Update state with "a" and "c".
-  ASSERT_OK(constrained_decoder.UpdateConstraintState(tokens_id_tensor_buffer));
+  ASSERT_OK(constrained_decoder.UpdateState(tokens_id_tensor_buffer));
 
   std::vector<float> logits_data(vocab_size_ * 2, 1.0f);
   RankedTensorType logits_tensor_type(
@@ -212,7 +211,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize2) {
       CreateTokenIdsTensorBuffer<float>(env, logits_data.data(),
                                         {2, 1, vocab_size_}));
 
-  ASSERT_OK(constrained_decoder.MaskLogits(logits_tensor_buffer));
+  ASSERT_OK(constrained_decoder.ProcessLogits(logits_tensor_buffer));
 
   // Verify that only "<e>" is allowed.
   LITERT_ASSERT_OK_AND_ASSIGN(
@@ -223,7 +222,7 @@ TEST_F(ConstrainedDecoderTest, UpdateStateAndMaskLogitsBatchSize2) {
     if (token_id == spm_processor_.PieceToId("<e>")) {
       EXPECT_EQ(masked_logits_span[i], 1.0f);
     } else {
-      EXPECT_EQ(masked_logits_span[i], std::numeric_limits<float>::lowest());
+      EXPECT_EQ(masked_logits_span[i], -std::numeric_limits<float>::infinity());
     }
   }
 }
@@ -243,12 +242,11 @@ TEST_F(ConstrainedDecoderTest, UpdateStateFailsWithWrongBatchSize) {
 
   // UpdateState should fail because the batch size does not match the expected
   // batch size.
-  EXPECT_THAT(
-      constrained_decoder.UpdateConstraintState(tokens_id_tensor_buffer),
-      StatusIs(absl::StatusCode::kInternal));
+  EXPECT_THAT(constrained_decoder.UpdateState(tokens_id_tensor_buffer),
+              StatusIs(absl::StatusCode::kInternal));
 }
 
-TEST_F(ConstrainedDecoderTest, MaskLogitsFailsWithWrongBatchSize) {
+TEST_F(ConstrainedDecoderTest, ProcessLogitsFailsWithWrongBatchSize) {
   ASSERT_OK_AND_ASSIGN(
       auto constraint,
       provider_->CreateConstraint(FstConstraintArg{.constraint_string = "ab"}));
@@ -262,7 +260,7 @@ TEST_F(ConstrainedDecoderTest, MaskLogitsFailsWithWrongBatchSize) {
       CreateTokenIdsTensorBuffer<int32_t>(env, token_ids, {1, 1}));
 
   // Update state with "a".
-  ASSERT_OK(constrained_decoder.UpdateConstraintState(tokens_id_tensor_buffer));
+  ASSERT_OK(constrained_decoder.UpdateState(tokens_id_tensor_buffer));
 
   std::vector<float> logits_data(vocab_size_ * 2, 1.0f);
   RankedTensorType logits_tensor_type(
@@ -272,13 +270,13 @@ TEST_F(ConstrainedDecoderTest, MaskLogitsFailsWithWrongBatchSize) {
       auto logits_tensor_buffer,
       CreateTokenIdsTensorBuffer<float>(env, logits_data.data(),
                                         {2, 1, vocab_size_}));
-  // MaskLogits should fail because the batch size does not match the expected
-  // batch size.
-  EXPECT_THAT(constrained_decoder.MaskLogits(logits_tensor_buffer),
+  // ProcessLogits should fail because the batch size does not match the
+  // expected batch size.
+  EXPECT_THAT(constrained_decoder.ProcessLogits(logits_tensor_buffer),
               StatusIs(absl::StatusCode::kInternal));
 }
 
-TEST_F(ConstrainedDecoderTest, MaskLogitsFailsWithWrongVolabSize) {
+TEST_F(ConstrainedDecoderTest, ProcessLogitsWithPaddedVocabSize) {
   ASSERT_OK_AND_ASSIGN(
       auto constraint,
       provider_->CreateConstraint(FstConstraintArg{.constraint_string = "ab"}));
@@ -292,21 +290,29 @@ TEST_F(ConstrainedDecoderTest, MaskLogitsFailsWithWrongVolabSize) {
       CreateTokenIdsTensorBuffer<int32_t>(env, token_ids, {1, 1}));
 
   // Update state with "a".
-  ASSERT_OK(constrained_decoder.UpdateConstraintState(tokens_id_tensor_buffer));
+  ASSERT_OK(constrained_decoder.UpdateState(tokens_id_tensor_buffer));
 
-  std::vector<float> logits_data(vocab_size_ + 1, 1.0f);
-  RankedTensorType logits_tensor_type(
-      {/*.element_type=*/kLiteRtElementTypeFloat32,
-       BuildLayout({2, 1, vocab_size_})});
+  // Padded model vocabulary dimension (larger than constraint vocabulary size).
+  int padded_vocab_size = vocab_size_ + 16;
+  std::vector<float> logits_data(padded_vocab_size, 2.0f);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto logits_tensor_buffer,
       CreateTokenIdsTensorBuffer<float>(env, logits_data.data(),
-                                        {1, 1, vocab_size_ + 1}));
+                                        {1, 1, padded_vocab_size}));
 
-  // MaskLogits should fail because the vocabulary size does not match the
-  // expected vocabulary size.
-  EXPECT_THAT(constrained_decoder.MaskLogits(logits_tensor_buffer),
-              StatusIs(absl::StatusCode::kInternal));
+  // ProcessLogits should succeed with padded vocabulary size.
+  ASSERT_OK(constrained_decoder.ProcessLogits(logits_tensor_buffer));
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto masked_logits_span,
+      ReferTensorBufferAsSpan<float>(logits_tensor_buffer));
+  for (int i = 0; i < padded_vocab_size; ++i) {
+    if (i == spm_processor_.PieceToId("b")) {
+      EXPECT_EQ(masked_logits_span[i], 2.0f);
+    } else {
+      EXPECT_EQ(masked_logits_span[i], -std::numeric_limits<float>::infinity());
+    }
+  }
 }
 
 }  // namespace

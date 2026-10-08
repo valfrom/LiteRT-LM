@@ -15,6 +15,10 @@
 #include <jni.h>
 #include <sys/stat.h>
 
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,20 +26,32 @@
 #include <variant>
 #include <vector>
 
-#include "absl/base/log_severity.h"  // from @com_google_absl
+#include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
-#include "absl/log/globals.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
-#include "litert/c/internal/litert_logging.h"  // from @litert
+#include "litert/cc/internal/scoped_file.h"  // from @litert
+#include "c/model_info.h"
+#include "kotlin/java/com/google/ai/edge/litertlm/jni/jni_utils.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
+#include "runtime/components/model_resources.h"
+#include "runtime/components/model_resources_litert_lm.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
+#include "runtime/conversation/thinking_config.h"
+#include "runtime/core/embedding_engine_impl.h"
+#include "runtime/engine/embedding_engine.h"
+#include "runtime/engine/embedding_engine_settings.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -44,10 +60,9 @@
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/file_util.h"
+#include "runtime/util/litert_lm_loader.h"
+#include "runtime/util/litert_util.h"
 #include "runtime/util/logging.h"
-#include "schema/capabilities/capabilities_c.h"
-#include "tflite/logger.h"  // from @litert
-#include "tflite/minimal_logging.h"  // from @litert
 
 // For Windows, __declspec( dllexport ) is required to export function in .dll.
 // https://learn.microsoft.com/en-us/cpp/cpp/using-dllimport-and-dllexport-in-cpp-classes?view=msvc-170
@@ -86,6 +101,9 @@ using litert::lm::Responses;
 using litert::lm::SessionConfig;
 using litert::lm::proto::SamplerParameters;
 
+using litert::lm::jni::GetJniEnvAndAttach;
+using litert::lm::jni::NewStringStandardUTF;
+
 void ThrowLiteRtLmJniException(JNIEnv* env, const std::string& message) {
   jclass exClass =
       env->FindClass("com/google/ai/edge/litertlm/LiteRtLmJniException");
@@ -96,57 +114,21 @@ void ThrowLiteRtLmJniException(JNIEnv* env, const std::string& message) {
   }
 }
 
-// Replacement of env->NewStringUTF(str.c_str()) to handle "Standard UTF-8".
-//
-// NewStringUTF() expects a "modified UTF-8" string. "Standard UTF-8" and
-// "modified UTF-8" are mostly the same, but differ in the encoding of null
-// characters and characters outside the Basic Multilingual Plane (BMP). Emojis
-// often fall into this latter category. nlohmann::json::dump() also returns a
-// "Standard UTF-8".
-//
-// https://developer.android.com/ndk/guides/jni-tips#utf-8-and-utf-16-strings
-jstring NewStringStandardUTF(JNIEnv* env, std::string standard_utf8_str) {
-  // Create a jbyteArray from the UTF-8 string
-  jbyteArray bytes = env->NewByteArray(standard_utf8_str.length());
-  if (bytes == nullptr) return nullptr;
-  env->SetByteArrayRegion(
-      bytes, 0, standard_utf8_str.length(),
-      reinterpret_cast<const jbyte*>(standard_utf8_str.c_str()));
-
-  // Get the java.lang.String class
-  jclass string_class = env->FindClass("java/lang/String");
-  if (string_class == nullptr) {
-    env->DeleteLocalRef(bytes);
-    return nullptr;
+absl::StatusOr<litert::lm::ActivationDataType> ConvertActivationDataType(
+    jint activation_data_type) {
+  switch (activation_data_type) {
+    case 0:
+      return litert::lm::ActivationDataType::FLOAT32;
+    case 1:
+      return litert::lm::ActivationDataType::FLOAT16;
+    case 2:
+      return litert::lm::ActivationDataType::INT16;
+    case 3:
+      return litert::lm::ActivationDataType::INT8;
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unsupported activation data type: ", activation_data_type));
   }
-
-  // Get the constructor for String(byte[], String)
-  jmethodID string_ctor =
-      env->GetMethodID(string_class, "<init>", "([BLjava/lang/String;)V");
-  if (string_ctor == nullptr) {
-    env->DeleteLocalRef(string_class);
-    env->DeleteLocalRef(bytes);
-    return nullptr;
-  }
-
-  // Create a jstring for the charset name "UTF-8"
-  jstring charset_name = env->NewStringUTF("UTF-8");
-  if (charset_name == nullptr) {
-    env->DeleteLocalRef(string_class);
-    env->DeleteLocalRef(bytes);
-    return nullptr;
-  }
-
-  // Create the new String object
-  jstring result =
-      (jstring)env->NewObject(string_class, string_ctor, bytes, charset_name);
-
-  // Clean up local references
-  env->DeleteLocalRef(bytes);
-  env->DeleteLocalRef(string_class);
-  env->DeleteLocalRef(charset_name);
-
-  return result;
 }
 
 // Helper function to convert BenchmarkInfo to Java object
@@ -183,8 +165,8 @@ jobject CreateBenchmarkInfoJni(
 
   double total_init_time_ms = 0.0;
   for (const auto& phase : benchmark_info.GetInitPhases()) {
-    ABSL_LOG(INFO) << "Init phase: " << phase.first << " took "
-                   << absl::ToDoubleMilliseconds(phase.second) << " ms";
+    ABSL_VLOG(1) << "Init phase: " << phase.first << " took "
+                 << absl::ToDoubleMilliseconds(phase.second) << " ms";
     total_init_time_ms += absl::ToDoubleMilliseconds(phase.second);
   }
 
@@ -255,35 +237,6 @@ std::vector<InputData> GetNativeInputData(JNIEnv* env,
   return contents;
 }
 
-// Helper to get JNIEnv and attach to the current thread if necessary.
-// Returns nullptr if an error occurs.
-JNIEnv* GetJniEnvAndAttach(JavaVM* jvm, bool* attached) {
-  JNIEnv* env = nullptr;
-  *attached = false;
-  // Requesting JNI_VERSION_1_6, but the returned JNIEnv* will support
-  // the highest version the current JVM provides. This is safe because
-  // newer JNI versions are backward-compatible.
-  int get_env_stat = jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-  if (get_env_stat == JNI_EDETACHED) {
-#if defined(__ANDROID__)
-    if (jvm->AttachCurrentThread(&env, nullptr) == 0) {
-#else
-    if (jvm->AttachCurrentThread((void**)&env, nullptr) == 0) {
-#endif
-      *attached = true;
-      return env;
-    } else {
-      ABSL_LOG(ERROR) << "Failed to attach to JVM.";
-      return nullptr;
-    }
-  } else if (get_env_stat == JNI_OK) {
-    return env;
-  } else {
-    ABSL_LOG(ERROR) << "Failed to get JNIEnv: GetEnv returned " << get_env_stat;
-    return nullptr;
-  }
-}
-
 // Helper function to create SamplerParameters from Java SamplerConfig object.
 SamplerParameters CreateSamplerParamsFromJni(JNIEnv* env,
                                              jobject sampler_config_obj) {
@@ -319,6 +272,126 @@ SamplerParameters CreateSamplerParamsFromJni(JNIEnv* env,
   return sampler_params;
 }
 
+litert::lm::ThinkingConfig CreateThinkingConfigFromJni(
+    JNIEnv* env, jobject thinking_config_obj) {
+  jclass thinking_config_cls = env->GetObjectClass(thinking_config_obj);
+
+  jmethodID get_enable_thinking_mid =
+      env->GetMethodID(thinking_config_cls, "getEnableThinking", "()Z");
+  bool enable_thinking =
+      env->CallBooleanMethod(thinking_config_obj, get_enable_thinking_mid);
+
+  jmethodID get_thinking_token_budget_mid =
+      env->GetMethodID(thinking_config_cls, "getThinkingTokenBudget", "()I");
+  int thinking_token_budget =
+      env->CallIntMethod(thinking_config_obj, get_thinking_token_budget_mid);
+
+  env->DeleteLocalRef(thinking_config_cls);
+
+  return litert::lm::ThinkingConfig(enable_thinking, thinking_token_budget);
+}
+
+std::optional<float> GetOptionalFloatFieldFromJni(JNIEnv* env, jobject obj,
+                                                  jclass cls,
+                                                  const char* method_name) {
+  jmethodID mid = env->GetMethodID(cls, method_name, "()Ljava/lang/Float;");
+  if (mid == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return std::nullopt;
+  }
+  jobject float_obj = env->CallObjectMethod(obj, mid);
+  if (float_obj == nullptr) {
+    return std::nullopt;
+  }
+  jclass float_cls = env->FindClass("java/lang/Float");
+  jmethodID float_val_mid = env->GetMethodID(float_cls, "floatValue", "()F");
+  float val = env->CallFloatMethod(float_obj, float_val_mid);
+  env->DeleteLocalRef(float_cls);
+  env->DeleteLocalRef(float_obj);
+  return val;
+}
+
+std::optional<int> GetOptionalIntFieldFromJni(JNIEnv* env, jobject obj,
+                                              jclass cls,
+                                              const char* method_name) {
+  jmethodID mid = env->GetMethodID(cls, method_name, "()Ljava/lang/Integer;");
+  if (mid == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return std::nullopt;
+  }
+  jobject int_obj = env->CallObjectMethod(obj, mid);
+  if (int_obj == nullptr) {
+    return std::nullopt;
+  }
+  jclass int_cls = env->FindClass("java/lang/Integer");
+  jmethodID int_val_mid = env->GetMethodID(int_cls, "intValue", "()I");
+  int val = env->CallIntMethod(int_obj, int_val_mid);
+  env->DeleteLocalRef(int_cls);
+  env->DeleteLocalRef(int_obj);
+  return val;
+}
+
+litert::lm::RepetitionPenaltyConfig CreateRepetitionPenaltyConfigFromJni(
+    JNIEnv* env, jobject repetition_penalty_config_obj) {
+  jclass cls = env->GetObjectClass(repetition_penalty_config_obj);
+
+  auto repetition_penalty_opt = GetOptionalFloatFieldFromJni(
+      env, repetition_penalty_config_obj, cls, "getRepetitionPenalty");
+  auto presence_penalty_opt = GetOptionalFloatFieldFromJni(
+      env, repetition_penalty_config_obj, cls, "getPresencePenalty");
+  auto frequency_penalty_opt = GetOptionalFloatFieldFromJni(
+      env, repetition_penalty_config_obj, cls, "getFrequencyPenalty");
+  auto window_size_opt = GetOptionalIntFieldFromJni(
+      env, repetition_penalty_config_obj, cls, "getWindowSize");
+
+  env->DeleteLocalRef(cls);
+
+  auto default_config = litert::lm::RepetitionPenaltyConfig::Default();
+  return litert::lm::RepetitionPenaltyConfig(
+      repetition_penalty_opt.has_value() ? *repetition_penalty_opt
+                                         : default_config.repetition_penalty(),
+      presence_penalty_opt.has_value() ? *presence_penalty_opt
+                                       : default_config.presence_penalty(),
+      frequency_penalty_opt.has_value() ? *frequency_penalty_opt
+                                        : default_config.frequency_penalty(),
+      window_size_opt.has_value() ? *window_size_opt
+                                  : default_config.window_size());
+}
+
+litert::lm::NoRepeatNgramConfig CreateNoRepeatNgramConfigFromJni(
+    JNIEnv* env, jobject no_repeat_ngram_config_obj) {
+  jclass cls = env->GetObjectClass(no_repeat_ngram_config_obj);
+
+  auto no_repeat_ngram_size_opt = GetOptionalIntFieldFromJni(
+      env, no_repeat_ngram_config_obj, cls, "getNoRepeatNgramSize");
+  auto window_size_opt = GetOptionalIntFieldFromJni(
+      env, no_repeat_ngram_config_obj, cls, "getWindowSize");
+
+  env->DeleteLocalRef(cls);
+
+  auto default_config = litert::lm::NoRepeatNgramConfig::Default();
+  return litert::lm::NoRepeatNgramConfig(
+      no_repeat_ngram_size_opt.has_value()
+          ? *no_repeat_ngram_size_opt
+          : default_config.no_repeat_ngram_size(),
+      window_size_opt.has_value() ? *window_size_opt
+                                  : default_config.window_size());
+}
+
+litert::lm::SuppressTokensConfig CreateSuppressTokensConfigFromJni(
+    JNIEnv* env, jintArray suppress_tokens_array) {
+  absl::flat_hash_set<int> suppress_tokens;
+  if (suppress_tokens_array != nullptr) {
+    jsize size = env->GetArrayLength(suppress_tokens_array);
+    jint* elements = env->GetIntArrayElements(suppress_tokens_array, nullptr);
+    for (int i = 0; i < size; ++i) {
+      suppress_tokens.insert(elements[i]);
+    }
+    env->ReleaseIntArrayElements(suppress_tokens_array, elements, JNI_ABORT);
+  }
+  return litert::lm::SuppressTokensConfig(std::move(suppress_tokens));
+}
+
 nlohmann::ordered_json GetExtraContextJson(JNIEnv* env,
                                            jstring extra_context_json_string) {
   const char* extra_context_chars =
@@ -338,6 +411,16 @@ std::optional<int> GetOptionalInt(JNIEnv* env, jobject integer_obj) {
   jint value = env->CallIntMethod(integer_obj, int_value_mid);
   env->DeleteLocalRef(integer_class);
   return value;
+}
+
+std::optional<bool> GetOptionalBoolean(JNIEnv* env, jobject boolean_obj) {
+  if (boolean_obj == nullptr) return std::nullopt;
+  jclass boolean_class = env->FindClass("java/lang/Boolean");
+  jmethodID boolean_value_mid =
+      env->GetMethodID(boolean_class, "booleanValue", "()Z");
+  jboolean value = env->CallBooleanMethod(boolean_obj, boolean_value_mid);
+  env->DeleteLocalRef(boolean_class);
+  return (value == JNI_TRUE);
 }
 
 std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
@@ -376,7 +459,8 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
     jint max_num_images, jstring cache_dir, jboolean enable_benchmark,
     jobject enable_speculative_decoding, jstring main_npu_native_library_dir,
     jstring vision_npu_native_library_dir, jstring audio_npu_native_library_dir,
-    jint main_backend_num_threads, jint audio_backend_num_threads) {
+    jint main_backend_num_threads, jint audio_backend_num_threads,
+    jint max_vision_tokens_per_image, jint activation_data_type) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
@@ -536,6 +620,28 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
         advanced_settings);
   }
 
+  if (max_vision_tokens_per_image > 0) {
+    settings->SetMaxVisionTokensPerImage(max_vision_tokens_per_image);
+  }
+
+  if (activation_data_type >= 0) {
+    auto data_type = ConvertActivationDataType(activation_data_type);
+    if (!data_type.ok()) {
+      ThrowLiteRtLmJniException(env, data_type.status().ToString());
+      return 0;
+    }
+    settings->GetMutableMainExecutorSettings().SetActivationDataType(
+        *data_type);
+    if (vision_backend_optional.has_value()) {
+      settings->GetMutableVisionExecutorSettings()->SetActivationDataType(
+          *data_type);
+    }
+    if (audio_backend_optional.has_value()) {
+      settings->GetMutableAudioExecutorSettings()->SetActivationDataType(
+          *data_type);
+    }
+  }
+
   auto engine = EngineFactory::CreateDefault(*settings);
   if (!engine.ok()) {
     ThrowLiteRtLmJniException(
@@ -549,7 +655,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
     JNIEnv* env, jclass thiz, jstring model_path, jstring backend,
     jint prefill_tokens, jint decode_tokens, jstring cache_dir,
-    jstring main_npu_native_library_dir) {
+    jstring main_npu_native_library_dir, jobject enable_speculative_decoding) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
@@ -601,6 +707,19 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
         main_npu_native_library_dir_str);
   }
 
+  auto advanced_settings =
+      settings->GetMainExecutorSettings().GetAdvancedSettings().value_or(
+          litert::lm::AdvancedSettings());
+  if (enable_speculative_decoding != nullptr) {
+    jmethodID boolean_value_mid = env->GetMethodID(
+        env->FindClass("java/lang/Boolean"), "booleanValue", "()Z");
+    jboolean is_enabled =
+        env->CallBooleanMethod(enable_speculative_decoding, boolean_value_mid);
+    advanced_settings.enable_speculative_decoding = (is_enabled == JNI_TRUE);
+  }
+  settings->GetMutableMainExecutorSettings().SetAdvancedSettings(
+      advanced_settings);
+
   auto& benchmark_params = settings->GetMutableBenchmarkParams();
   benchmark_params.set_num_prefill_tokens(prefill_tokens);
   benchmark_params.set_num_decode_tokens(decode_tokens);
@@ -620,14 +739,47 @@ JNI_METHOD(nativeDeleteEngine)(JNIEnv* env, jclass thiz, jlong engine_pointer) {
   delete reinterpret_cast<Engine*>(engine_pointer);
 }
 
-LITERTLM_JNIEXPORT jlong JNICALL
-JNI_METHOD(nativeCreateSession)(JNIEnv* env, jclass thiz, jlong engine_pointer,
-                                jobject sampler_config_obj) {
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
+    JNIEnv* env, jclass thiz, jlong engine_pointer, jobject sampler_config_obj,
+    jstring lora_path_str, jstring audio_lora_path_str,
+    jobject enable_speculative_decoding) {
   auto session_config = SessionConfig::CreateDefault();
+  if (auto enable_spec_dec =
+          GetOptionalBoolean(env, enable_speculative_decoding);
+      enable_spec_dec.has_value()) {
+    session_config.SetEnableSpeculativeDecoding(*enable_spec_dec);
+  }
 
   if (sampler_config_obj != nullptr) {
     session_config.GetMutableSamplerParams() =
         CreateSamplerParamsFromJni(env, sampler_config_obj);
+  }
+
+  if (lora_path_str != nullptr) {
+    const char* lora_path = env->GetStringUTFChars(lora_path_str, nullptr);
+    auto lora_file = ::litert::ScopedFile::Open(lora_path);
+    env->ReleaseStringUTFChars(lora_path_str, lora_path);
+    if (!lora_file.ok()) {
+      ThrowLiteRtLmJniException(
+          env, "Failed to open LoRA file: " + lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*lora_file)));
+  }
+
+  if (audio_lora_path_str != nullptr) {
+    const char* audio_lora_path =
+        env->GetStringUTFChars(audio_lora_path_str, nullptr);
+    auto audio_lora_file = ::litert::ScopedFile::Open(audio_lora_path);
+    env->ReleaseStringUTFChars(audio_lora_path_str, audio_lora_path);
+    if (!audio_lora_file.ok()) {
+      ThrowLiteRtLmJniException(env, "Failed to open Audio LoRA file: " +
+                                         audio_lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetAudioScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*audio_lora_file)));
   }
 
   Engine* engine = reinterpret_cast<Engine*>(engine_pointer);
@@ -859,16 +1011,55 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
     jstring messages_json_string, jstring tools_description_json_string,
     jstring channels_json_string, jstring extra_context_json_string,
     jboolean enable_constrained_decoding,
-    jboolean filter_channel_content_from_kv_cache,
-    jstring overwrite_prompt_template) {
+    jobject filter_channel_content_from_kv_cache_obj,
+    jstring overwrite_prompt_template, jstring lora_path_str,
+    jstring audio_lora_path_str, jboolean prefill_preface_on_init,
+    jint max_output_token, jobject thinking_config_obj,
+    jboolean enable_response_format, jobject enable_speculative_decoding) {
   Engine* engine = reinterpret_cast<Engine*>(engine_pointer);
 
   // Create a native SessionConfig
   auto session_config = SessionConfig::CreateDefault();
+  if (auto enable_spec_dec =
+          GetOptionalBoolean(env, enable_speculative_decoding);
+      enable_spec_dec.has_value()) {
+    session_config.SetEnableSpeculativeDecoding(*enable_spec_dec);
+  }
+  if (max_output_token > 0) {
+    session_config.SetMaxOutputTokens(max_output_token);
+  }
   if (sampler_config_obj != nullptr) {
     session_config.GetMutableSamplerParams() =
         CreateSamplerParamsFromJni(env, sampler_config_obj);
   }
+
+  if (lora_path_str != nullptr) {
+    const char* lora_path = env->GetStringUTFChars(lora_path_str, nullptr);
+    auto lora_file = ::litert::ScopedFile::Open(lora_path);
+    env->ReleaseStringUTFChars(lora_path_str, lora_path);
+    if (!lora_file.ok()) {
+      ThrowLiteRtLmJniException(
+          env, "Failed to open LoRA file: " + lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*lora_file)));
+  }
+
+  if (audio_lora_path_str != nullptr) {
+    const char* audio_lora_path =
+        env->GetStringUTFChars(audio_lora_path_str, nullptr);
+    auto audio_lora_file = ::litert::ScopedFile::Open(audio_lora_path);
+    env->ReleaseStringUTFChars(audio_lora_path_str, audio_lora_path);
+    if (!audio_lora_file.ok()) {
+      ThrowLiteRtLmJniException(env, "Failed to open Audio LoRA file: " +
+                                         audio_lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetAudioScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*audio_lora_file)));
+  }
+
   if (engine->GetEngineSettings().GetAudioExecutorSettings().has_value()) {
     session_config.SetAudioModalityEnabled(true);
   }
@@ -913,8 +1104,22 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
           .SetSessionConfig(session_config)
           .SetPreface(json_preface)
           .SetEnableConstrainedDecoding(enable_constrained_decoding)
-          .SetFilterChannelContentFromKvCache(
-              filter_channel_content_from_kv_cache);
+          .SetPrefillPrefaceOnInit(prefill_preface_on_init);
+
+  if (filter_channel_content_from_kv_cache_obj != nullptr) {
+    jclass boolean_class = env->FindClass("java/lang/Boolean");
+    jmethodID boolean_value_mid =
+        env->GetMethodID(boolean_class, "booleanValue", "()Z");
+    jboolean filter_val = env->CallBooleanMethod(
+        filter_channel_content_from_kv_cache_obj, boolean_value_mid);
+    env->DeleteLocalRef(boolean_class);
+    conversation_config_builder.SetFilterChannelContentFromKvCache(filter_val);
+  }
+
+  if (enable_response_format) {
+    conversation_config_builder.SetConstraintProviderConfig(
+        litert::lm::LlGuidanceConfig());
+  }
 
   // Set the channels, if provided.
   // If channels is nullptr, the Conversation will use the channels defined in
@@ -951,6 +1156,12 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
     }
   }
 
+  // Set the thinking config, if provided.
+  if (thinking_config_obj != nullptr) {
+    conversation_config_builder.SetThinkingConfig(
+        CreateThinkingConfigFromJni(env, thinking_config_obj));
+  }
+
   // Build the conversation
   auto conversation_config = conversation_config_builder.Build(*engine);
 
@@ -977,7 +1188,10 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteConversation)(
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
     JNIEnv* env, jclass thiz, jlong conversation_pointer,
     jstring messageJSONString, jstring extraContextJsonString, jobject callback,
-    jobject visual_token_budget) {
+    jobject visual_token_budget, jobject repetition_penalty_config_obj,
+    jobject no_repeat_ngram_config_obj, jintArray suppress_tokens_array,
+    jint max_output_token, jobject thinking_config_obj, jint constraint_type,
+    jstring constraint_string) {
   JavaVM* jvm = nullptr;
   if (env->GetJavaVM(&jvm) != JNI_OK) {
     ThrowLiteRtLmJniException(env, "Failed to get JavaVM");
@@ -1001,6 +1215,48 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
   auto args = GetDataProcessorArguments(env, conversation, visual_token_budget);
   if (args.has_value()) {
     optional_args.args = std::move(args);
+  }
+
+  if (repetition_penalty_config_obj != nullptr) {
+    optional_args.repetition_penalty_config =
+        CreateRepetitionPenaltyConfigFromJni(env,
+                                             repetition_penalty_config_obj);
+  }
+
+  if (no_repeat_ngram_config_obj != nullptr) {
+    optional_args.no_repeat_ngram_config =
+        CreateNoRepeatNgramConfigFromJni(env, no_repeat_ngram_config_obj);
+  }
+
+  if (suppress_tokens_array != nullptr) {
+    optional_args.suppress_tokens_config =
+        CreateSuppressTokensConfigFromJni(env, suppress_tokens_array);
+  }
+
+  if (max_output_token > 0) {
+    optional_args.max_output_tokens = max_output_token;
+  }
+
+  if (thinking_config_obj != nullptr) {
+    optional_args.thinking_config =
+        CreateThinkingConfigFromJni(env, thinking_config_obj);
+  }
+
+  if (constraint_type != 0) {
+    litert::lm::LlGuidanceConstraintArg constraint_arg;
+    if (constraint_type == 1) {
+      constraint_arg.constraint_type = litert::lm::LlgConstraintType::kRegex;
+    } else if (constraint_type == 2) {
+      constraint_arg.constraint_type =
+          litert::lm::LlgConstraintType::kJsonSchema;
+    }
+    if (constraint_string != nullptr) {
+      const char* constraint_chars =
+          env->GetStringUTFChars(constraint_string, nullptr);
+      constraint_arg.constraint_string = constraint_chars;
+      env->ReleaseStringUTFChars(constraint_string, constraint_chars);
+    }
+    optional_args.decoding_constraint = constraint_arg;
   }
 
   jobject callback_global = env->NewGlobalRef(callback);
@@ -1086,7 +1342,10 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
 LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeSendMessage)(
     JNIEnv* env, jclass thiz, jlong conversation_pointer,
     jstring messageJSONString, jstring extraContextJsonString,
-    jobject visual_token_budget) {
+    jobject visual_token_budget, jobject repetition_penalty_config_obj,
+    jobject no_repeat_ngram_config_obj, jintArray suppress_tokens_array,
+    jint max_output_token, jobject thinking_config_obj, jint constraint_type,
+    jstring constraint_string) {
   Conversation* conversation =
       reinterpret_cast<Conversation*>(conversation_pointer);
 
@@ -1104,6 +1363,48 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeSendMessage)(
   auto args = GetDataProcessorArguments(env, conversation, visual_token_budget);
   if (args.has_value()) {
     optional_args.args = std::move(args);
+  }
+
+  if (repetition_penalty_config_obj != nullptr) {
+    optional_args.repetition_penalty_config =
+        CreateRepetitionPenaltyConfigFromJni(env,
+                                             repetition_penalty_config_obj);
+  }
+
+  if (no_repeat_ngram_config_obj != nullptr) {
+    optional_args.no_repeat_ngram_config =
+        CreateNoRepeatNgramConfigFromJni(env, no_repeat_ngram_config_obj);
+  }
+
+  if (suppress_tokens_array != nullptr) {
+    optional_args.suppress_tokens_config =
+        CreateSuppressTokensConfigFromJni(env, suppress_tokens_array);
+  }
+
+  if (max_output_token > 0) {
+    optional_args.max_output_tokens = max_output_token;
+  }
+
+  if (thinking_config_obj != nullptr) {
+    optional_args.thinking_config =
+        CreateThinkingConfigFromJni(env, thinking_config_obj);
+  }
+
+  if (constraint_type != 0) {
+    litert::lm::LlGuidanceConstraintArg constraint_arg;
+    if (constraint_type == 1) {
+      constraint_arg.constraint_type = litert::lm::LlgConstraintType::kRegex;
+    } else if (constraint_type == 2) {
+      constraint_arg.constraint_type =
+          litert::lm::LlgConstraintType::kJsonSchema;
+    }
+    if (constraint_string != nullptr) {
+      const char* constraint_chars =
+          env->GetStringUTFChars(constraint_string, nullptr);
+      constraint_arg.constraint_string = constraint_chars;
+      env->ReleaseStringUTFChars(constraint_string, constraint_chars);
+    }
+    optional_args.decoding_constraint = constraint_arg;
   }
 
   auto response =
@@ -1155,33 +1456,609 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(
   return NewStringStandardUTF(env, *response);
 }
 
-LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateCapabilities)(
+LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(
+    nativeConversationRenderPrefaceIntoString)(JNIEnv* env, jclass thiz,
+                                               jlong conversation_pointer) {
+  Conversation* conversation =
+      reinterpret_cast<Conversation*>(conversation_pointer);
+
+  auto response =
+      conversation->RenderPrefaceIntoString(litert::lm::OptionalArgs());
+  if (!response.ok()) {
+    ThrowLiteRtLmJniException(
+        env, absl::StrCat(
+                 "Failed to call nativeConversationRenderPrefaceIntoString: ",
+                 response.status().ToString()));
+    return nullptr;
+  }
+
+  return NewStringStandardUTF(env, *response);
+}
+
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateModelInfo)(
     JNIEnv* env, jclass thiz, jstring model_path) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
 
-  auto loaded_file = litert_lm_loaded_file_create(model_path_str.c_str());
-  if (loaded_file == nullptr) {
+  auto model_info = litert_lm_loaded_file_create(model_path_str.c_str());
+  if (model_info == nullptr) {
     ThrowLiteRtLmJniException(
         env, "Failed to open LiteRT-LM file: " + model_path_str);
     return 0;
   }
 
-  return reinterpret_cast<jlong>(loaded_file);
+  return reinterpret_cast<jlong>(model_info);
 }
 
-LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteCapabilities)(
-    JNIEnv* env, jclass thiz, jlong capabilities_pointer) {
+LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteModelInfo)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
   litert_lm_loaded_file_delete(
-      reinterpret_cast<LiteRtLmLoadedFile*>(capabilities_pointer));
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
 }
 
+// JNI bridge method to check speculative decoding support.
 LITERTLM_JNIEXPORT jboolean JNICALL
 JNI_METHOD(nativeHasSpeculativeDecodingSupport)(JNIEnv* env, jclass thiz,
-                                                jlong capabilities_pointer) {
+                                                jlong model_info_pointer) {
   return litert_lm_loaded_file_has_speculative_decoding_support(
-      reinterpret_cast<LiteRtLmLoadedFile*>(capabilities_pointer));
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+// JNI bridge method to check thinking/reasoning budget support.
+LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsThinking)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_supports_thinking(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+// JNI bridge method to check function calling/tool use support.
+LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsFunctionCalling)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_supports_function_calling(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeSamplerType)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_sampler_type(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jfloat JNICALL JNI_METHOD(nativeSamplerTemp)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_sampler_temperature(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeSamplerTopK)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_sampler_top_k(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jfloat JNICALL JNI_METHOD(nativeSamplerTopP)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_sampler_top_p(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+// JNI bridge method to check if the model supports the requested input
+// modality.
+LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsInputModality)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
+  return litert_lm_loaded_file_supports_input_modality(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+      static_cast<LiteRtLmModality>(modality));
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeMaxVisionTokenBudget)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_max_vision_token_budget(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeMaxContextTokens)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_max_context_tokens(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeIsDynamicContext)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_is_dynamic_context(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jintArray JNICALL JNI_METHOD(nativeVisionSignatureSelection)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
+  int32_t count =
+      litert_lm_loaded_file_vision_signature_selection(model_info, nullptr, 0);
+  if (count == -1) {
+    return nullptr;
+  }
+  std::vector<int32_t> lengths(count);
+  litert_lm_loaded_file_vision_signature_selection(model_info, lengths.data(),
+                                                   count);
+  jintArray result = env->NewIntArray(count);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  env->SetIntArrayRegion(result, 0, count,
+                         reinterpret_cast<const jint*>(lengths.data()));
+  return result;
+}
+
+LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeMinRuntimeVersion)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  const char* version = litert_lm_loaded_file_min_runtime_version(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  if (version == nullptr) {
+    return nullptr;
+  }
+  return env->NewStringUTF(version);
+}
+
+LITERTLM_JNIEXPORT jintArray JNICALL JNI_METHOD(
+    nativeModalitySupportedBackends)(JNIEnv* env, jclass thiz,
+                                     jlong model_info_pointer, jint modality) {
+  auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
+  int32_t count = litert_lm_loaded_file_modality_supported_backends(
+      model_info, static_cast<LiteRtLmModality>(modality), nullptr, 0);
+  if (count <= 0) {
+    return nullptr;
+  }
+  std::vector<LiteRtLmBackendType> backends(count);
+  litert_lm_loaded_file_modality_supported_backends(
+      model_info, static_cast<LiteRtLmModality>(modality), backends.data(),
+      count);
+  jintArray result = env->NewIntArray(count);
+  if (result == nullptr) return nullptr;
+  std::vector<jint> j_backends(count);
+  for (int i = 0; i < count; ++i) {
+    j_backends[i] = static_cast<jint>(backends[i]);
+  }
+  env->SetIntArrayRegion(result, 0, count, j_backends.data());
+  return result;
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeModalityNpuBrand)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
+  return static_cast<jint>(litert_lm_loaded_file_modality_npu_brand(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+      static_cast<LiteRtLmModality>(modality)));
+}
+
+// JNI bridge method to get the NPU SoC name string for a given modality.
+LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeModalitySocName)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
+  const char* soc_name = litert_lm_loaded_file_modality_soc_name(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+      static_cast<LiteRtLmModality>(modality));
+  if (soc_name == nullptr) {
+    return nullptr;
+  }
+  return env->NewStringUTF(soc_name);
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeModelType)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return static_cast<jint>(litert_lm_loaded_file_model_type(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer)));
+}
+
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeEmbeddingDimension)(
+    JNIEnv* env, jclass thiz, jlong model_info_pointer) {
+  return litert_lm_loaded_file_embedding_dimension(
+      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+}
+
+LITERTLM_JNIEXPORT jintArray JNICALL
+JNI_METHOD(nativeEmbeddingSignatureSelection)(JNIEnv* env, jclass thiz,
+                                              jlong model_info_pointer) {
+  auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
+  int32_t count = litert_lm_loaded_file_embedding_signature_selection(
+      model_info, nullptr, 0);
+  if (count == -1) {
+    return nullptr;
+  }
+  std::vector<int32_t> lengths(count);
+  litert_lm_loaded_file_embedding_signature_selection(
+      model_info, lengths.data(), count);
+  jintArray result = env->NewIntArray(count);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  env->SetIntArrayRegion(result, 0, count,
+                         reinterpret_cast<const jint*>(lengths.data()));
+  return result;
+}
+
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEmbeddingEngine)(
+    JNIEnv* env, jclass thiz, jint model_fd, jstring model_path,
+    jstring backend, jstring vision_backend, jstring audio_backend,
+    jstring cache_dir, jstring main_npu_native_library_dir,
+    jstring vision_npu_native_library_dir, jstring audio_npu_native_library_dir,
+    jint main_backend_num_threads, jint audio_backend_num_threads,
+    jint max_input_length, jint vision_tokens_per_image,
+    jint activation_data_type) {
+  ::litert::ScopedFile scoped_file;
+  absl::StatusOr<litert::lm::ModelAssets> model_assets;
+
+  if (model_fd >= 0) {
+#if defined(_WIN32)
+    ThrowLiteRtLmJniException(
+        env, "Model file descriptor is not supported on Windows.");
+    return 0;
+#else
+    auto owned_fd = dup(model_fd);
+    if (owned_fd < 0) {
+      ThrowLiteRtLmJniException(
+          env, absl::StrCat("Failed to duplicate input file descriptor: ",
+                            strerror(errno)));
+      return 0;
+    }
+    scoped_file = ::litert::ScopedFile(owned_fd);
+    auto dup_status = scoped_file.Duplicate();
+    if (!dup_status.ok()) {
+      ThrowLiteRtLmJniException(
+          env, absl::StrCat("Failed to duplicate model file descriptor: ",
+                            dup_status.status().ToString()));
+      return 0;
+    }
+    auto shared_scoped_file =
+        std::make_shared<::litert::ScopedFile>(std::move(*dup_status));
+    model_assets = litert::lm::ModelAssets::Create(shared_scoped_file);
+#endif
+  } else {
+    std::string model_path_str;
+    if (model_path != nullptr) {
+      const char* model_path_chars =
+          env->GetStringUTFChars(model_path, nullptr);
+      model_path_str = model_path_chars;
+      env->ReleaseStringUTFChars(model_path, model_path_chars);
+    }
+
+    auto open_status = ::litert::ScopedFile::Open(model_path_str);
+    if (!open_status.ok()) {
+      ThrowLiteRtLmJniException(env,
+                                absl::StrCat("Failed to open model file: ",
+                                             open_status.status().ToString()));
+      return 0;
+    }
+    scoped_file = std::move(*open_status);
+    model_assets = litert::lm::ModelAssets::Create(model_path_str);
+  }
+
+  if (!model_assets.ok()) {
+    ThrowLiteRtLmJniException(env,
+                              absl::StrCat("Failed to create model assets: ",
+                                           model_assets.status().ToString()));
+    return 0;
+  }
+
+  auto loader = litert::lm::LitertLmLoader::Create(std::move(scoped_file));
+  if (!loader.ok()) {
+    ThrowLiteRtLmJniException(env, absl::StrCat("Failed to create loader: ",
+                                                loader.status().ToString()));
+    return 0;
+  }
+
+  auto resources =
+      litert::lm::ModelResourcesLitertLm::Create(std::move(*loader));
+  if (!resources.ok()) {
+    ThrowLiteRtLmJniException(env,
+                              absl::StrCat("Failed to create model resources: ",
+                                           resources.status().ToString()));
+    return 0;
+  }
+
+  auto tokenizer = (*resources)->GetTokenizer();
+  if (!tokenizer.ok() || !*tokenizer) {
+    ThrowLiteRtLmJniException(env, "Tokenizer not found in model resources.");
+    return 0;
+  }
+
+  const char* backend_chars = env->GetStringUTFChars(backend, nullptr);
+  std::string backend_str(backend_chars);
+  env->ReleaseStringUTFChars(backend, backend_chars);
+
+  auto backend_enum = litert::lm::GetBackendFromString(backend_str);
+  if (!backend_enum.ok()) {
+    ThrowLiteRtLmJniException(env, backend_enum.status().ToString());
+    return 0;
+  }
+
+  const char* vision_backend_chars =
+      env->GetStringUTFChars(vision_backend, nullptr);
+  std::string vision_backend_str(vision_backend_chars);
+  env->ReleaseStringUTFChars(vision_backend, vision_backend_chars);
+
+  std::optional<litert::lm::Backend> vision_backend_optional = std::nullopt;
+  if (!vision_backend_str.empty()) {
+    auto vision_backend_enum =
+        litert::lm::GetBackendFromString(vision_backend_str);
+    if (!vision_backend_enum.ok()) {
+      ThrowLiteRtLmJniException(env, vision_backend_enum.status().ToString());
+      return 0;
+    }
+    vision_backend_optional = vision_backend_enum.value();
+  }
+
+  const char* audio_backend_chars =
+      env->GetStringUTFChars(audio_backend, nullptr);
+  std::string audio_backend_str(audio_backend_chars);
+  env->ReleaseStringUTFChars(audio_backend, audio_backend_chars);
+
+  std::optional<litert::lm::Backend> audio_backend_optional = std::nullopt;
+  if (!audio_backend_str.empty()) {
+    auto audio_backend_enum =
+        litert::lm::GetBackendFromString(audio_backend_str);
+    if (!audio_backend_enum.ok()) {
+      ThrowLiteRtLmJniException(env, audio_backend_enum.status().ToString());
+      return 0;
+    }
+    audio_backend_optional = audio_backend_enum.value();
+  }
+
+  auto settings = litert::lm::EmbeddingEngineSettings::CreateDefault(
+      *model_assets, *backend_enum, vision_backend_optional,
+      audio_backend_optional);
+  if (!settings.ok()) {
+    ThrowLiteRtLmJniException(env,
+                              "Failed to create embedding engine settings: " +
+                                  settings.status().ToString());
+    return 0;
+  }
+
+  const char* cache_dir_chars = env->GetStringUTFChars(cache_dir, nullptr);
+  std::string cache_dir_str(cache_dir_chars);
+  env->ReleaseStringUTFChars(cache_dir, cache_dir_chars);
+  if (!cache_dir_str.empty()) {
+    settings->GetMutableMainExecutorSettings().SetCacheDir(cache_dir_str);
+    if (vision_backend_optional.has_value() &&
+        settings->GetVisionExecutorSettings().has_value()) {
+      settings->GetMutableVisionExecutorSettings()->SetCacheDir(cache_dir_str);
+    }
+    if (audio_backend_optional.has_value() &&
+        settings->GetAudioExecutorSettings().has_value()) {
+      settings->GetMutableAudioExecutorSettings()->SetCacheDir(cache_dir_str);
+    }
+  }
+
+  const char* main_npu_native_library_dir_chars =
+      env->GetStringUTFChars(main_npu_native_library_dir, nullptr);
+  std::string main_npu_native_library_dir_str(
+      main_npu_native_library_dir_chars);
+  env->ReleaseStringUTFChars(main_npu_native_library_dir,
+                             main_npu_native_library_dir_chars);
+  if (!main_npu_native_library_dir_str.empty()) {
+    settings->GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
+        main_npu_native_library_dir_str);
+  }
+
+  const char* vision_npu_native_library_dir_chars =
+      env->GetStringUTFChars(vision_npu_native_library_dir, nullptr);
+  std::string vision_npu_native_library_dir_str(
+      vision_npu_native_library_dir_chars);
+  env->ReleaseStringUTFChars(vision_npu_native_library_dir,
+                             vision_npu_native_library_dir_chars);
+  if (!vision_npu_native_library_dir_str.empty() &&
+      vision_backend_optional.has_value() &&
+      settings->GetVisionExecutorSettings().has_value()) {
+    settings->GetMutableVisionExecutorSettings()->SetLitertDispatchLibDir(
+        vision_npu_native_library_dir_str);
+  }
+
+  const char* audio_npu_native_library_dir_chars =
+      env->GetStringUTFChars(audio_npu_native_library_dir, nullptr);
+  std::string audio_npu_native_library_dir_str(
+      audio_npu_native_library_dir_chars);
+  env->ReleaseStringUTFChars(audio_npu_native_library_dir,
+                             audio_npu_native_library_dir_chars);
+  if (!audio_npu_native_library_dir_str.empty() &&
+      audio_backend_optional.has_value() &&
+      settings->GetAudioExecutorSettings().has_value()) {
+    settings->GetMutableAudioExecutorSettings()->SetLitertDispatchLibDir(
+        audio_npu_native_library_dir_str);
+  }
+
+  if (main_backend_num_threads > 0) {
+    settings->GetMutableMainExecutorSettings().SetNumThreads(
+        main_backend_num_threads);
+  }
+
+  if (audio_backend_optional.has_value() && audio_backend_num_threads > 0 &&
+      settings->GetAudioExecutorSettings().has_value()) {
+    settings->GetMutableAudioExecutorSettings()->SetNumThreads(
+        audio_backend_num_threads);
+  }
+
+  if (max_input_length > 0) {
+    settings->SetMaxInputLength(max_input_length);
+  }
+  if (vision_tokens_per_image > 0) {
+    settings->SetVisionTokensPerImage(vision_tokens_per_image);
+  }
+
+  if (activation_data_type >= 0) {
+    auto data_type = ConvertActivationDataType(activation_data_type);
+    if (!data_type.ok()) {
+      ThrowLiteRtLmJniException(env, data_type.status().ToString());
+      return 0;
+    }
+    settings->GetMutableMainExecutorSettings().SetActivationDataType(
+        *data_type);
+    if (settings->GetMutableVisionExecutorSettings().has_value()) {
+      settings->GetMutableVisionExecutorSettings()->SetActivationDataType(
+          *data_type);
+    }
+    if (settings->GetMutableAudioExecutorSettings().has_value()) {
+      settings->GetMutableAudioExecutorSettings()->SetActivationDataType(
+          *data_type);
+    }
+  }
+
+  auto owned_env = litert::lm::CreateEnvironment(*settings, (*resources).get());
+  if (!owned_env.ok()) {
+    ThrowLiteRtLmJniException(
+        env, "Failed to create environment: " + owned_env.status().ToString());
+    return 0;
+  }
+
+  auto engine = litert::lm::EmbeddingEngineImpl::Create(
+      std::move(*resources),
+      std::make_unique<litert::lm::OwnedEnvironment>(std::move(*owned_env)),
+      std::move(*tokenizer), std::move(*settings));
+  if (!engine.ok()) {
+    ThrowLiteRtLmJniException(env, "Failed to create EmbeddingEngineImpl: " +
+                                       engine.status().ToString());
+    return 0;
+  }
+
+  return reinterpret_cast<jlong>(engine->release());
+}
+
+LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteEmbeddingEngine)(
+    JNIEnv* env, jclass thiz, jlong embedding_engine_pointer) {
+  if (embedding_engine_pointer != 0) {
+    delete reinterpret_cast<litert::lm::EmbeddingEngine*>(
+        embedding_engine_pointer);
+  }
+}
+
+LITERTLM_JNIEXPORT jobject JNICALL JNI_METHOD(nativeComputeEmbedding)(
+    JNIEnv* env, jclass thiz, jlong embedding_engine_pointer,
+    jobjectArray input_data, jobject normalize, jobject insert_special_tokens,
+    jobject output_size, jobject vision_tokens_per_image) {
+  auto* engine =
+      reinterpret_cast<litert::lm::EmbeddingEngine*>(embedding_engine_pointer);
+  if (!engine) {
+    ThrowLiteRtLmJniException(env, "EmbeddingEngine pointer is null.");
+    return nullptr;
+  }
+
+  std::vector<litert::lm::InputData> contents =
+      GetNativeInputData(env, input_data);
+  if (env->ExceptionCheck()) {
+    return nullptr;
+  }
+
+  litert::lm::EmbeddingOptions options;
+  if (auto opt_norm = GetOptionalBoolean(env, normalize);
+      opt_norm.has_value()) {
+    options.normalize = *opt_norm;
+  }
+  if (auto opt_tokens = GetOptionalBoolean(env, insert_special_tokens);
+      opt_tokens.has_value()) {
+    options.insert_special_tokens = *opt_tokens;
+  }
+  if (auto opt_size = GetOptionalInt(env, output_size); opt_size.has_value()) {
+    options.output_size = *opt_size;
+  }
+  if (auto opt_vision_tokens = GetOptionalInt(env, vision_tokens_per_image);
+      opt_vision_tokens.has_value()) {
+    options.vision_tokens_per_image = *opt_vision_tokens;
+  }
+
+  auto response = engine->ComputeEmbedding(contents, options);
+  if (!response.ok()) {
+    ThrowLiteRtLmJniException(
+        env, "ComputeEmbedding failed: " + response.status().ToString());
+    return nullptr;
+  }
+
+  auto vec = response->embedding;
+
+  jclass response_cls =
+      env->FindClass("com/google/ai/edge/litertlm/EmbeddingResponse");
+  jmethodID ctor = env->GetMethodID(response_cls, "<init>", "([F)V");
+
+  jfloatArray float_arr = env->NewFloatArray(vec.size());
+  if (float_arr != nullptr && !vec.empty()) {
+    env->SetFloatArrayRegion(float_arr, 0, vec.size(), vec.data());
+  }
+
+  jobject response_obj = env->NewObject(response_cls, ctor, float_arr);
+  env->DeleteLocalRef(response_cls);
+  env->DeleteLocalRef(float_arr);
+  return response_obj;
+}
+
+LITERTLM_JNIEXPORT jobjectArray JNICALL JNI_METHOD(nativeComputeEmbeddingBatch)(
+    JNIEnv* env, jclass thiz, jlong embedding_engine_pointer,
+    jobjectArray input_data_batch, jobject normalize,
+    jobject insert_special_tokens, jobject output_size,
+    jobject vision_tokens_per_image) {
+  auto* engine =
+      reinterpret_cast<litert::lm::EmbeddingEngine*>(embedding_engine_pointer);
+  if (!engine) {
+    ThrowLiteRtLmJniException(env, "EmbeddingEngine pointer is null.");
+    return nullptr;
+  }
+
+  jsize batch_size = env->GetArrayLength(input_data_batch);
+  std::vector<std::vector<litert::lm::InputData>> contents_batch;
+  contents_batch.reserve(batch_size);
+
+  for (jsize i = 0; i < batch_size; ++i) {
+    jobjectArray single_request = static_cast<jobjectArray>(
+        env->GetObjectArrayElement(input_data_batch, i));
+    contents_batch.push_back(GetNativeInputData(env, single_request));
+    env->DeleteLocalRef(single_request);
+    if (env->ExceptionCheck()) {
+      return nullptr;
+    }
+  }
+
+  litert::lm::EmbeddingOptions options;
+  if (auto opt_norm = GetOptionalBoolean(env, normalize);
+      opt_norm.has_value()) {
+    options.normalize = *opt_norm;
+  }
+  if (auto opt_tokens = GetOptionalBoolean(env, insert_special_tokens);
+      opt_tokens.has_value()) {
+    options.insert_special_tokens = *opt_tokens;
+  }
+  if (auto opt_size = GetOptionalInt(env, output_size); opt_size.has_value()) {
+    options.output_size = *opt_size;
+  }
+  if (auto opt_vision_tokens = GetOptionalInt(env, vision_tokens_per_image);
+      opt_vision_tokens.has_value()) {
+    options.vision_tokens_per_image = *opt_vision_tokens;
+  }
+
+  auto batch_response = engine->ComputeEmbeddingBatch(contents_batch, options);
+  if (!batch_response.ok()) {
+    ThrowLiteRtLmJniException(env, "ComputeEmbeddingBatch failed: " +
+                                       batch_response.status().ToString());
+    return nullptr;
+  }
+
+  jclass response_cls =
+      env->FindClass("com/google/ai/edge/litertlm/EmbeddingResponse");
+  jmethodID ctor = env->GetMethodID(response_cls, "<init>", "([F)V");
+
+  jobjectArray result_array =
+      env->NewObjectArray(batch_response->size(), response_cls, nullptr);
+
+  for (size_t i = 0; i < batch_response->size(); ++i) {
+    auto vec = (*batch_response)[i].embedding;
+
+    jfloatArray float_arr = env->NewFloatArray(vec.size());
+    if (float_arr != nullptr && !vec.empty()) {
+      env->SetFloatArrayRegion(float_arr, 0, vec.size(), vec.data());
+    }
+
+    jobject response_obj = env->NewObject(response_cls, ctor, float_arr);
+    env->SetObjectArrayElement(result_array, i, response_obj);
+    env->DeleteLocalRef(response_obj);
+    env->DeleteLocalRef(float_arr);
+  }
+
+  env->DeleteLocalRef(response_cls);
+  return result_array;
 }
 
 }  // extern "C"

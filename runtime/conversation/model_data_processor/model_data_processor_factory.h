@@ -19,14 +19,14 @@
 #include <optional>
 #include <vector>
 
+#include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "runtime/components/prompt_template.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 
@@ -37,20 +37,21 @@ namespace litert::lm {
 // - tokenizer: The tokenizer used by the LLM model.
 // - stop_token_ids: The stop token ids used by the LLM model.
 // - enable_constrained_decoding: Whether to enable constrained decoding.
-// - capabilities: The capabilities of the prompt template.
 absl::StatusOr<std::unique_ptr<ModelDataProcessor>> CreateModelDataProcessor(
     const DataProcessorConfig& config,
     std::optional<Preface> preface = std::nullopt,
     const Tokenizer* tokenizer = nullptr,
     const std::vector<std::vector<int>>& stop_token_ids = {},
-    bool enable_constrained_decoding = false,
-    PromptTemplateCapabilities capabilities = PromptTemplateCapabilities());
+    bool enable_constrained_decoding = false);
 
 // Creates data processor config from the given LlmModelType. The
 // DataProcessorConfig has default values if the corresponding fields are not
 // set in the LlmModelType.
 absl::StatusOr<DataProcessorConfig> CreateDataProcessorConfigFromLlmModelType(
     const proto::LlmModelType& llm_model_type);
+
+absl::Status ValidateVisualTokenBudget(const DataProcessorArguments& args,
+                                       int max_vision_tokens_per_image);
 
 }  // namespace litert::lm
 

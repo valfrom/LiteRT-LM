@@ -36,11 +36,12 @@ namespace litert::lm {
 //
 // const json user_message{
 //     {"role", "user"},
-//     {"content", "I need help"},
+//     {"content", {{{"type", "text"}, {"text", "I need help"}}}},
 // };
 // const json assistant_message{
 //     {"role", "assistant"},
-//     {"content", "Hi, what can I do for you?"},
+//     {"content", {{{"type", "text"}, {"text", "Hi, what can I do for
+//     you?"}}}},
 // };
 // const json tools = json::parse(R"({
 //   "type": "function",
@@ -62,7 +63,7 @@ namespace litert::lm {
 //
 // PromptTemplateInput input;
 // input.messages = json::array({user_message,
-//                                message_assistant_text});
+//                                assistant_message});
 // input.tools = tools;
 // input.add_generation_prompt = false;
 // input.extra_context = json::object({{"extra_key", "extra_value"}});
@@ -70,7 +71,7 @@ namespace litert::lm {
 //
 // const std::string template_content = ReadTemplateFromFile(template_file);
 // PromptTemplate template(template_content);
-// ASSIGN_OR_RETURN(std::string rendered_prompt, template.Apply(input));
+// ABSL_ASSIGN_OR_RETURN(std::string rendered_prompt, template.Apply(input));
 struct PromptTemplateInput {
   // The messages in the conversation.
   nlohmann::ordered_json messages;
@@ -99,21 +100,6 @@ struct PromptTemplateInput {
 
 // The capabilities of the prompt template.
 struct PromptTemplateCapabilities {
-  // Whether the template supports tools.
-  bool supports_tools = false;
-  // Whether the template supports tool calls.
-  bool supports_tool_calls = false;
-  // Whether the template supports system role.
-  bool supports_system_role = false;
-  // Whether the template supports parallel tool calls.
-  bool supports_parallel_tool_calls = false;
-  // Whether the template supports tool call id.
-  bool supports_tool_call_id = false;
-
-  // Whether the template requires typed content. {"type": "text"}, {"type":
-  // "image"}, {"type": "audio"}, {"type": "video"} etc.
-  bool requires_typed_content = false;
-
   // Whether the template supports single turn, i.e. appending to the prefill
   // without repeating the whole history.
   bool supports_single_turn = false;
@@ -124,10 +110,7 @@ class PromptTemplate {
  public:
   // Creates a PromptTemplate from the string content.
   // template_content: the jinja template string.
-  // edit_template_for_minijinja: whether to edit the template to be compatible
-  // with Mini Jinja.
-  explicit PromptTemplate(absl::string_view template_content,
-                          bool edit_template_for_minijinja = true);
+  explicit PromptTemplate(absl::string_view template_content);
 
   // Copying constructor.
   PromptTemplate(const PromptTemplate&);

@@ -16,17 +16,22 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_H_
 
 #include <memory>
+#include <optional>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "litert/cc/litert_environment.h"  // from @litert
+#include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 
@@ -108,12 +113,25 @@ class SessionInterface {
   // function will handle the prefill and decode processes internally and
   // the usage is similar to the Gemini Text Generation API
   // (https://ai.google.dev/gemini-api/docs/text-generation).
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   // - contents: The input data for generation.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::StatusOr<Responses> GenerateContent(
       const std::vector<InputData>& contents) = 0;
 
   // This is a not blocking call and the function will return right away. The
   // result will be streamed through the callback.
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   //
   // - contents: The input data for generation.
   // - callback: Callback to receive streamed results.
@@ -125,12 +143,23 @@ class SessionInterface {
   //       sent.
   //     - If the generation is cancelled, the callback will be called
   //       with a Cancellation error.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) = 0;
 
   // Same as above, but with a custom decode config.
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   // - decode_config: configuration for the model decode process.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -181,6 +210,19 @@ class SessionInterface {
     return absl::UnimplementedError("Not implemented.");
   }
 
+  // Similar to RunPrefillAsync, but accepts preprocessed (e.g., tokenized)
+  // contents.
+  // This is a non-blocking call and the function will return right away. The
+  // processing status will be signaled through the callback.
+  // - preprocessed_contents: The preprocessed input data.
+  // - callback: Callback to receive the prefill results.
+  virtual absl::StatusOr<std::unique_ptr<TaskController>>
+  PrefillPreprocessedContents(
+      std::vector<InputData> preprocessed_contents,
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+    return absl::UnimplementedError("Not implemented.");
+  }
+
   // Starts the decoding process for the model to predict the response based
   // on the input prompt/query added after using RunPrefill* functions.
   // This is a blocking call and the function will return when the decoding
@@ -219,8 +261,11 @@ class SessionInterface {
   virtual absl::StatusOr<BenchmarkInfo*> GetMutableBenchmarkInfo() = 0;
 
   // Cancels the ongoing inference process. Note that if this function is
-  // called, the inference process will return with a kCancelled error. The
-  // session could still be used after afterwards.
+  // called, the inference process will return with a kCancelled error.
+  //
+  // NOTE: Reusing the session after calling CancelProcess() is neither
+  // recommended nor supported. Calling CancelProcess() leaves the session
+  // state poisoned, and subsequent operations may fail or behave incorrectly.
   virtual void CancelProcess() {
     ABSL_LOG(FATAL) << "CancelProcess is not implemented.";
   }
@@ -278,6 +323,11 @@ class SessionInterface {
     return absl::UnimplementedError("RewindToCheckpoint not implemented.");
   }
 
+  // Rewinds the session to a specific step number.
+  virtual absl::Status RewindToStep(int step) {
+    return absl::UnimplementedError("RewindToStep not implemented.");
+  }
+
   // Get the current step of the session.
   virtual absl::StatusOr<int> GetCurrentStep() const {
     return absl::UnimplementedError("GetCurrentStep not implemented.");
@@ -285,6 +335,19 @@ class SessionInterface {
 
   // Get the reference to the session config for the session.
   virtual const SessionConfig& GetSessionConfig() const = 0;
+
+  // Returns the debug info for the session, or nullopt if unsupported
+  // or debugger is disabled.
+  virtual std::optional<SessionDebugInfo> GetSessionDebugInfo() const {
+    return std::nullopt;
+  }
+
+  // Returns the LiteRT environment associated with this session, if available.
+  // The returned pointer is non-owning and guaranteed valid as long as the
+  // parent Engine is alive.
+  virtual absl::StatusOr<const Environment*> GetEnvironment() const {
+    return absl::UnimplementedError("GetEnvironment is not implemented.");
+  }
 };
 
 // EngineT is the templated interface for the LLM runtime.
@@ -319,7 +382,19 @@ class EngineT {
   virtual const EngineSettings& GetEngineSettings() const = 0;
 
   // Get the reference to the tokenizer for the engine.
-  virtual const Tokenizer& GetTokenizer() const = 0;
+  virtual const support::Tokenizer& GetTokenizer() const = 0;
+
+  // Get the reference to the tokenizer for the engine for a specific model
+  // type. Defaults to GetTokenizer() for kTfLitePrefillDecode.
+  virtual absl::StatusOr<const support::Tokenizer*> GetTokenizer(
+      ModelType model_type) const {
+    if (model_type == ModelType::kTfLitePrefillDecode) {
+      return &GetTokenizer();
+    }
+    return absl::UnimplementedError(absl::StrCat("GetTokenizer for model type ",
+                                                 ModelTypeToString(model_type),
+                                                 " is not implemented."));
+  }
 
   // Get the audio model properties for the session. This is only available
   // if the engine is created with audio modality enabled.
@@ -330,6 +405,33 @@ class EngineT {
   // if the engine is created with vision modality enabled.
   virtual absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
       const = 0;
+
+  // Updates whether to enable Metal residency set on GPU at runtime.
+  //
+  // To configure this setting during initialization, configure
+  // AdvancedSettings::gpu_enable_metal_residency_set in EngineSettings before
+  // creating the engine.
+  //
+  // When enabled on Apple platforms (macOS and iOS with Metal GPU backend),
+  // this uses Apple's MTLResidencySet API to ensure model weights and
+  // allocations remain resident in GPU memory, preventing memory swapping and
+  // reducing allocation overhead.
+  //
+  // This setting is only supported on Apple platforms (macOS / iOS) with the
+  // GPU backend. On other platforms (e.g. Linux, Android, Windows) or non-GPU
+  // backends, this setting has no effect and is safely ignored.
+  virtual absl::Status UpdateGpuEnableMetalResidencySet(
+      bool enable_metal_residency_set) {
+    return absl::UnimplementedError(
+        "UpdateGpuEnableMetalResidencySet not implemented.");
+  }
+
+  // Returns the LiteRT environment managed by the engine.
+  // The returned pointer is non-owning and guaranteed valid for the lifetime
+  // of this engine.
+  virtual absl::StatusOr<const Environment*> GetEnvironment() const {
+    return absl::UnimplementedError("GetEnvironment is not implemented.");
+  }
 
   // Default timeout duration for the engine/session processes.
   static constexpr absl::Duration kDefaultTimeout = absl::Minutes(10);

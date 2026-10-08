@@ -19,11 +19,12 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
+#include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
@@ -32,12 +33,12 @@
 #if !defined(LITERT_LM_FST_CONSTRAINTS_DISABLED)
 #include "runtime/components/constrained_decoding/gemma_model_constraint_provider.h"
 #endif
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/components/tool_use/fc_tool_format_utils.h"
 #include "runtime/components/tool_use/parser_utils.h"
 #include "runtime/conversation/io_types.h"
+#include "runtime/conversation/model_data_processor/data_utils.h"
 #include "runtime/conversation/model_data_processor/function_gemma_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/model_data_processor.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/status_macros.h"
 #include "sentencepiece_model.pb.h"  // from @sentencepiece
@@ -114,7 +115,7 @@ absl::StatusOr<std::string> FormatToolResponse(
   }
 
   if (!response.is_null()) {
-    ASSIGN_OR_RETURN(std::string value, FormatValueAsFc(response));
+    ABSL_ASSIGN_OR_RETURN(std::string value, FormatValueAsFc(response));
     return absl::StrCat(*tool_name, value);
   }
 
@@ -123,25 +124,27 @@ absl::StatusOr<std::string> FormatToolResponse(
   nlohmann::ordered_json fields = tool_response;
   fields.erase("tool_name");
   fields.erase("name");
-  ASSIGN_OR_RETURN(std::string value, FormatValueAsFc(fields));
+  ABSL_ASSIGN_OR_RETURN(std::string value, FormatValueAsFc(fields));
   return absl::StrCat(*tool_name, value);
 }
 
 // Formats "content" as a tool response in FC format.
 //
 // Case 1: If "content" is an object, formats "content" directly as a tool
-// response in FC format as a string.
+// response in FC format and returns an array of text parts.
 //
 // Case 2: If "content" is an array, formats each tool response item in the
-// array in FC format and returns an array of *text* items. A tool response
-// item is an object with "name" and "response" fields or an object with a
-// "tool_response" field.
+// array in FC format and returns an array of text parts.
 //
-// Case 3: If "content" is neither an object nor an array, returns it unchanged.
+// Case 3: If "content" is neither an object nor an array, normalizes it into
+// an array of text parts.
 absl::StatusOr<nlohmann::ordered_json> FormatToolResponses(
     const nlohmann::ordered_json& content) {
   if (content.is_object()) {
-    return FormatToolResponse(content);
+    ABSL_ASSIGN_OR_RETURN(std::string formatted_tool_response,
+                          FormatToolResponse(content));
+    return nlohmann::ordered_json::array(
+        {{{"type", "text"}, {"text", formatted_tool_response}}});
   }
 
   if (content.is_array()) {
@@ -155,8 +158,8 @@ absl::StatusOr<nlohmann::ordered_json> FormatToolResponses(
       }
 
       // Format each tool response in FC format and add it as a text item.
-      ASSIGN_OR_RETURN(std::string formatted_tool_response,
-                       FormatToolResponse(tool_response));
+      ABSL_ASSIGN_OR_RETURN(std::string formatted_tool_response,
+                            FormatToolResponse(tool_response));
       tool_content.push_back(
           {{"type", "text"}, {"text", formatted_tool_response}});
     }
@@ -164,9 +167,7 @@ absl::StatusOr<nlohmann::ordered_json> FormatToolResponses(
     return tool_content;
   }
 
-  // If the content of the message is not an array or object, pass it through
-  // unchanged.
-  return content;
+  return NormalizeContent(content);
 }
 
 // A message is a tool response if its role is "tool".
@@ -195,33 +196,34 @@ FunctionGemmaDataProcessor::Create(
       constraint_provider(nullptr,
                           &LiteRtLmGemmaModelConstraintProvider_Destroy);
   if (enable_constrained_decoding) {
-    std::vector<const int*> stop_token_ids_ptrs;
-    std::vector<size_t> stop_token_lengths;
-    stop_token_ids_ptrs.reserve(stop_token_ids.size());
-    stop_token_lengths.reserve(stop_token_ids.size());
-    for (const auto& stop_tokens : stop_token_ids) {
-      stop_token_ids_ptrs.push_back(stop_tokens.data());
-      stop_token_lengths.push_back(stop_tokens.size());
-    }
     if (tokenizer->GetTokenizerType() != TokenizerType::kSentencePiece) {
-      return absl::InvalidArgumentError(
-          "Constrained decoding is only supported for SentencePiece "
-          "tokenizer.");
+      ABSL_LOG(WARNING)
+          << "Constrained decoding is only supported for SentencePiece "
+             "tokenizer.";
+    } else {
+      std::vector<const int*> stop_token_ids_ptrs;
+      std::vector<size_t> stop_token_lengths;
+      stop_token_ids_ptrs.reserve(stop_token_ids.size());
+      stop_token_lengths.reserve(stop_token_ids.size());
+      for (const auto& stop_tokens : stop_token_ids) {
+        stop_token_ids_ptrs.push_back(stop_tokens.data());
+        stop_token_lengths.push_back(stop_tokens.size());
+      }
+      auto sp_tokenizer =
+          reinterpret_cast<const SentencePieceTokenizer*>(tokenizer);
+      auto serialized_model_proto =
+          sp_tokenizer->GetProcessor().model_proto().SerializeAsString();
+      LiteRtLmGemmaModelConstraintProvider* provider =
+          LiteRtLmGemmaModelConstraintProvider_Create(
+              serialized_model_proto.data(), serialized_model_proto.size(),
+              stop_token_ids_ptrs.data(), stop_token_lengths.data(),
+              stop_token_ids.size());
+      if (provider == nullptr) {
+        return absl::InternalError(
+            "Failed to create GemmaModelConstraintProvider.");
+      }
+      constraint_provider.reset(provider);
     }
-    auto sp_tokenizer =
-        reinterpret_cast<const SentencePieceTokenizer*>(tokenizer);
-    auto serialized_model_proto =
-        sp_tokenizer->GetProcessor().model_proto().SerializeAsString();
-    LiteRtLmGemmaModelConstraintProvider* provider =
-        LiteRtLmGemmaModelConstraintProvider_Create(
-            serialized_model_proto.data(), serialized_model_proto.size(),
-            stop_token_ids_ptrs.data(), stop_token_lengths.data(),
-            stop_token_ids.size());
-    if (provider == nullptr) {
-      return absl::InternalError(
-          "Failed to create GemmaModelConstraintProvider.");
-    }
-    constraint_provider.reset(provider);
   }
   return absl::WrapUnique(new FunctionGemmaDataProcessor(
       std::move(constraint_provider), config, preface));
@@ -232,13 +234,13 @@ absl::StatusOr<nlohmann::ordered_json>
 FunctionGemmaDataProcessor::MessageToTemplateInput(
     const nlohmann::ordered_json& message) const {
   if (config_.use_template_for_fc_format) {
-    return message;
+    return ModelDataProcessor::MessageToTemplateInput(message);
   }
 
   // If the message doesn't contain any tool calls and isn't a tool message,
-  // then the template input is the same as the message.
+  // then normalize message content and return.
   if (!message.contains("tool_calls") && message["role"] != "tool") {
-    return message;
+    return ModelDataProcessor::MessageToTemplateInput(message);
   }
 
   nlohmann::ordered_json template_input = nlohmann::ordered_json::object();
@@ -249,12 +251,10 @@ FunctionGemmaDataProcessor::MessageToTemplateInput(
   if (message.contains("content")) {
     if (IsToolMessage(template_input, message)) {
       // Convert tool responses to FC format.
-      ASSIGN_OR_RETURN(template_input["content"],
-                       FormatToolResponses(message["content"]));
+      ABSL_ASSIGN_OR_RETURN(template_input["content"],
+                            FormatToolResponses(message["content"]));
     } else {
-      // If the role is not "tool" or "content" is a string, pass through the
-      // content unchanged.
-      template_input["content"] = message["content"];
+      template_input["content"] = NormalizeContent(message["content"]);
     }
   }
 
@@ -275,8 +275,8 @@ FunctionGemmaDataProcessor::MessageToTemplateInput(
         if (function["arguments"].is_object()) {
           // If `arguments` is an object, format the values in FC format.
           for (const auto& [key, value] : function["arguments"].items()) {
-            ASSIGN_OR_RETURN(std::string formatted_value,
-                             FormatValueAsFc(value));
+            ABSL_ASSIGN_OR_RETURN(std::string formatted_value,
+                                  FormatValueAsFc(value));
             tool_call_input["function"]["arguments"][key] = formatted_value;
           }
         } else {
@@ -292,42 +292,15 @@ FunctionGemmaDataProcessor::MessageToTemplateInput(
   return template_input;
 }
 
-absl::StatusOr<std::vector<InputData>>
-FunctionGemmaDataProcessor::ToInputDataVectorImpl(
-    const std::string& rendered_template_prompt,
-    const nlohmann::ordered_json& messages,
-    const FunctionGemmaDataProcessorArguments& args) const {
-  std::vector<InputData> input_data;
-  input_data.push_back(InputText(rendered_template_prompt));
-  return input_data;
-}
-
 absl::StatusOr<Message> FunctionGemmaDataProcessor::ToMessageImpl(
     const Responses& responses,
     const FunctionGemmaDataProcessorArguments& args) const {
-  absl::string_view response_text = responses.GetTexts()[0];
-  nlohmann::ordered_json message = {{"role", "assistant"}};
-  if (preface_.has_value() && std::holds_alternative<JsonPreface>(*preface_) &&
-      !std::get<JsonPreface>(*preface_).tools.empty()) {
-    ASSIGN_OR_RETURN(
-        nlohmann::ordered_json content_and_tool_calls,
-        ParseTextAndToolCalls(
-            response_text, config_.code_fence_start, config_.code_fence_end,
-            GetSyntaxType(config_.syntax_type),
-            {.escape_fence_strings = config_.escape_fence_strings,
-             .tool_code_regex = config_.tool_code_regex,
-             .return_error_on_parse_failure = ReturnErrorOnParseFailure()}));
-    if (content_and_tool_calls.contains("content")) {
-      message["content"] = content_and_tool_calls["content"];
-    }
-    if (content_and_tool_calls.contains("tool_calls")) {
-      message["tool_calls"] = content_and_tool_calls["tool_calls"];
-    }
-  } else {
-    message["content"] = nlohmann::ordered_json::array(
-        {{{"type", "text"}, {"text", std::string(response_text)}}});
-  }
-  return message;
+  return ResponseTextToMessage(
+      responses.GetTexts()[0], preface_, config_.code_fence_start,
+      config_.code_fence_end, GetSyntaxType(config_.syntax_type),
+      {.escape_fence_strings = config_.escape_fence_strings,
+       .tool_code_regex = config_.tool_code_regex,
+       .return_error_on_parse_failure = ReturnErrorOnParseFailure()});
 }
 
 absl::StatusOr<nlohmann::ordered_json> FunctionGemmaDataProcessor::FormatTools(
@@ -341,7 +314,7 @@ absl::StatusOr<nlohmann::ordered_json> FunctionGemmaDataProcessor::FormatTools(
   }
   nlohmann::ordered_json formatted_tools = nlohmann::ordered_json::array();
   for (const auto& tool : tools) {
-    ASSIGN_OR_RETURN(std::string formatted_tool, FormatToolAsFc(tool));
+    ABSL_ASSIGN_OR_RETURN(std::string formatted_tool, FormatToolAsFc(tool));
     formatted_tools.push_back(formatted_tool);
   }
   return formatted_tools;

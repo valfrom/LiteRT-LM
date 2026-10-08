@@ -24,20 +24,27 @@
 #include <gtest/gtest.h>
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/escaping.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
 #include "runtime/components/constrained_decoding/llguidance_schema_utils.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/util/status_macros.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
+
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+using TokenIds = ::litert::support::TokenIds;
+
 namespace {
 
 struct TokenDef {
@@ -118,7 +125,8 @@ class SimpleTokenizer : public Tokenizer {
     return absl::NotFoundError(absl::StrCat("Token not found: ", token));
   }
 
-  absl::StatusOr<std::string> TokenIdsToText(const TokenIds& ids) override {
+  absl::StatusOr<std::string> TokenIdsToText(
+      absl::Span<const int> ids, bool skip_special_tokens) override {
     std::string text;
     for (int id : ids) {
       auto it = id_to_piece_.find(id);
@@ -151,6 +159,8 @@ class SimpleTokenizer : public Tokenizer {
     return tokens;
   }
 
+  int GetVocabSize() const override { return kVocabSize; }
+
  private:
   absl::flat_hash_map<std::string, int> vocab_;
   absl::flat_hash_map<int, std::string> id_to_piece_;
@@ -175,18 +185,18 @@ class LlgPythonToolCallsTest : public testing::Test {
 
   absl::StatusOr<bool> AcceptsInternal(Constraint& constraint,
                                        absl::string_view text) {
-    ASSIGN_OR_RETURN(TokenIds ids, tokenizer_.TextToTokenIds(text));
+    ABSL_ASSIGN_OR_RETURN(TokenIds ids, tokenizer_.TextToTokenIds(text));
     auto state = constraint.Start();
     for (int i = 0; i < ids.size(); ++i) {
       int id = ids[i];
-      ASSIGN_OR_RETURN(auto bitmap, constraint.ComputeBitmap(*state));
+      ABSL_ASSIGN_OR_RETURN(auto bitmap, constraint.ComputeBitmap(*state));
 
       if (!bitmap->Get(id)) {
         return false;
       }
-      ASSIGN_OR_RETURN(state, constraint.ComputeNext(*state, id));
+      ABSL_ASSIGN_OR_RETURN(state, constraint.ComputeNext(*state, id));
     }
-    ASSIGN_OR_RETURN(auto final_bitmap, constraint.ComputeBitmap(*state));
+    ABSL_ASSIGN_OR_RETURN(auto final_bitmap, constraint.ComputeBitmap(*state));
     return final_bitmap->Get(*config_.eos_id);
   }
 
@@ -610,6 +620,93 @@ set_timer(sound=True, duration=10)
 ```)");
 }
 
+// "integer" and "number" are distinct JSON Schema types and must map to
+// distinct grammar rules. GetRuleForType is shared with the FC grammar, so
+// both grammars have to define INTEGER; these cases would fail if only one
+// did.
+TEST_F(LlgPythonToolCallsTest, PythonIntegerParametersRejectFloats) {
+  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
+    "name": "set_timer",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "duration": {
+          "type": "integer"
+        }
+      },
+      "required": ["duration"]
+    }
+  })json");
+  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
+
+  LlgConstraintsOptions options =
+      GetDefaultPythonOptions(LlgConstraintMode::kFunctionCallsOnly);
+
+  auto constraint = CreateConstraint(tools, options);
+
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_timer(duration=10)
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_timer(duration=0)
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_timer(duration=-5)
+```)");
+
+  AssertRejects(*constraint,
+                R"(```tool_code
+set_timer(duration=10.5)
+```)");
+  AssertRejects(*constraint,
+                R"(```tool_code
+set_timer(duration=10.0)
+```)");
+  AssertRejects(*constraint,
+                R"(```tool_code
+set_timer(duration=1e3)
+```)");
+}
+
+// Guards the other direction: tightening "integer" must not also tighten
+// "number".
+TEST_F(LlgPythonToolCallsTest, PythonNumberParametersStillAcceptFloats) {
+  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
+    "name": "set_temperature",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "celsius": {
+          "type": "number"
+        }
+      },
+      "required": ["celsius"]
+    }
+  })json");
+  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
+
+  LlgConstraintsOptions options =
+      GetDefaultPythonOptions(LlgConstraintMode::kFunctionCallsOnly);
+
+  auto constraint = CreateConstraint(tools, options);
+
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_temperature(celsius=21.5)
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_temperature(celsius=21)
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+set_temperature(celsius=2.15e1)
+```)");
+}
+
 TEST_F(LlgPythonToolCallsTest, PythonOptionalParametersFlexibleOrder) {
   nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
     "name": "search",
@@ -928,6 +1025,99 @@ get_weather(location=None)
   AssertRejects(*constraint2,
                 R"(```tool_code
 get_weather()
+```)");
+}
+
+TEST_F(LlgPythonToolCallsTest, OneOfPropertyConstraint) {
+  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
+    "name": "selection",
+    "description": "Select an element",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "bounds": {
+          "one_of": [
+            { "type": "string" },
+            { "type": "number" }
+          ]
+        }
+      },
+      "required": ["bounds"]
+    }
+  })json");
+  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
+
+  LlgConstraintsOptions options =
+      GetDefaultPythonOptions(LlgConstraintMode::kFunctionCallsOnly);
+  auto constraint = CreateConstraint(tools, options);
+
+  AssertAccepts(*constraint,
+                R"(```tool_code
+selection(bounds="top_left")
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+selection(bounds=42)
+```)");
+  AssertRejects(*constraint,
+                R"(```tool_code
+selection(bounds=True)
+```)");
+}
+
+TEST_F(LlgPythonToolCallsTest, OneOfCamelCasePropertyConstraint) {
+  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
+    "name": "selection",
+    "description": "Select an element",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "bounds": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "number" }
+          ]
+        }
+      },
+      "required": ["bounds"]
+    }
+  })json");
+  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
+
+  LlgConstraintsOptions options =
+      GetDefaultPythonOptions(LlgConstraintMode::kFunctionCallsOnly);
+  auto constraint = CreateConstraint(tools, options);
+
+  AssertAccepts(*constraint,
+                R"(```tool_code
+selection(bounds="top_left")
+```)");
+  AssertAccepts(*constraint,
+                R"(```tool_code
+selection(bounds=42)
+```)");
+  AssertRejects(*constraint,
+                R"(```tool_code
+selection(bounds=True)
+```)");
+}
+
+TEST_F(LlgPythonToolCallsTest, OneOfToolsObjectWrapper) {
+  nlohmann::ordered_json tools_obj = nlohmann::ordered_json::parse(R"json({
+    "oneOf": [
+      {
+        "name": "get_time"
+      }
+    ]
+  })json");
+
+  LlgConstraintsOptions options =
+      GetDefaultPythonOptions(LlgConstraintMode::kFunctionCallsOnly);
+  auto constraint = CreateConstraint(tools_obj, options);
+
+  AssertAccepts(*constraint,
+                R"(```tool_code
+get_time()
 ```)");
 }
 

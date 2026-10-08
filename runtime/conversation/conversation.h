@@ -25,6 +25,7 @@
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
@@ -33,10 +34,14 @@
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/constraint_provider_config.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
+#include "runtime/conversation/thinking_config.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -97,12 +102,39 @@ class ConversationConfig {
     return return_error_on_parse_failure_;
   }
 
+  // Returns whether to return an error status when max num tokens reached.
+  bool return_error_on_max_tokens_reached() const {
+    return return_error_on_max_tokens_reached_;
+  }
+
+  // Returns the thinking configuration.
+  std::optional<ThinkingConfig> thinking_config() const {
+    return thinking_config_;
+  }
+
+  // Returns whether thinking/reasoning generation is enabled.
+  bool enable_thinking() const {
+    return thinking_config_.has_value() && thinking_config_->enable_thinking();
+  }
+
+  // Returns whether to stream tool call tokens.
+  bool stream_tool_calls() const { return stream_tool_calls_; }
+
+  // Returns the channel name for tool call tokens if they are streamed.
+  const std::string& stream_tool_calls_channel_name() const {
+    return stream_tool_calls_channel_name_;
+  }
+
+  // Returns whether to enable rewinding behavior (moving backwards in context
+  // without fully resetting to the beginning of the conversation).
+  bool enable_rewinding() const { return enable_rewinding_; }
+
  public:
   // Builder class for ConversationConfig.
   //
   // Example usage:
   //   // Create a ConversationConfig instance using the Builder.
-  //   ASSIGN_OR_RETURN(auto conversation_config,
+  //   ABSL_ASSIGN_OR_RETURN(auto conversation_config,
   //                    ConversationConfig::Builder()
   //                        .SetEnableConstrainedDecoding(true)
   //                        .SetPrefillPrefaceOnInit(true)
@@ -187,19 +219,48 @@ class ConversationConfig {
       return *this;
     }
 
+    // Sets whether to return an error status when max num tokens reached.
+    Builder& SetReturnErrorOnMaxTokensReached(
+        bool return_error_on_max_tokens_reached) {
+      return_error_on_max_tokens_reached_ = return_error_on_max_tokens_reached;
+      return *this;
+    }
+
+    // Sets the thinking configuration.
+    Builder& SetThinkingConfig(ThinkingConfig thinking_config) {
+      thinking_config_ = thinking_config;
+      return *this;
+    }
+
+    // Sets whether to stream tool call tokens.
+    Builder& SetStreamToolCalls(bool stream_tool_calls,
+                                const std::string& channel_name = "tool_call") {
+      stream_tool_calls_ = stream_tool_calls;
+      stream_tool_calls_channel_name_ = channel_name;
+      return *this;
+    }
+
+    // Sets whether to enable rewinding.
+    Builder& SetEnableRewinding(bool enable_rewinding) {
+      enable_rewinding_ = enable_rewinding;
+      return *this;
+    }
+
     absl::StatusOr<ConversationConfig> Build(const Engine& engine) {
       return ConversationConfig::CreateInternal(
           engine, session_config_, preface_, overwrite_prompt_template_,
           overwrite_processor_config_, enable_constrained_decoding_,
           prefill_preface_on_init_, constraint_provider_config_, channels_,
-          filter_channel_content_from_kv_cache_,
-          return_error_on_parse_failure_);
+          filter_channel_content_from_kv_cache_, return_error_on_parse_failure_,
+          return_error_on_max_tokens_reached_, thinking_config_,
+          stream_tool_calls_, stream_tool_calls_channel_name_,
+          enable_rewinding_);
     }
 
     // Returns a unique pointer to a ConversationConfig.
     absl::StatusOr<std::unique_ptr<ConversationConfig>> BuildUnique(
         const Engine& engine) {
-      ASSIGN_OR_RETURN(ConversationConfig config, Build(engine));
+      ABSL_ASSIGN_OR_RETURN(ConversationConfig config, Build(engine));
       return std::make_unique<ConversationConfig>(std::move(config));
     }
 
@@ -212,8 +273,13 @@ class ConversationConfig {
     bool prefill_preface_on_init_ = false;
     std::optional<ConstraintProviderConfig> constraint_provider_config_;
     std::optional<std::vector<Channel>> channels_ = std::nullopt;
-    bool filter_channel_content_from_kv_cache_ = false;
+    bool filter_channel_content_from_kv_cache_ = true;
     bool return_error_on_parse_failure_ = true;
+    bool return_error_on_max_tokens_reached_ = false;
+    std::optional<ThinkingConfig> thinking_config_ = std::nullopt;
+    bool stream_tool_calls_ = false;
+    std::string stream_tool_calls_channel_name_ = "tool_call";
+    bool enable_rewinding_ = true;
   };
 
   // Returns the constrained decoding config.
@@ -260,18 +326,28 @@ class ConversationConfig {
           std::nullopt,
       std::optional<std::vector<Channel>> channels = std::nullopt,
       bool filter_channel_content_from_kv_cache = false,
-      bool return_error_on_parse_failure = true);
+      bool return_error_on_parse_failure = true,
+      bool return_error_on_max_tokens_reached = false,
+      std::optional<ThinkingConfig> thinking_config = std::nullopt,
+      bool stream_tool_calls = false,
+      const std::string& stream_tool_calls_channel_name = "tool_call",
+      bool enable_rewinding = true);
 
-  explicit ConversationConfig(SessionConfig session_config, Preface preface,
-                              PromptTemplate prompt_template,
-                              DataProcessorConfig processor_config,
-                              bool constrained_decoding_enabled = false,
-                              bool prefill_preface_on_init = false,
-                              std::optional<ConstraintProviderConfig>
-                                  constraint_provider_config = std::nullopt,
-                              std::vector<Channel> channels = {},
-                              bool filter_channel_content_from_kv_cache = false,
-                              bool return_error_on_parse_failure = true)
+  explicit ConversationConfig(
+      SessionConfig session_config, Preface preface,
+      PromptTemplate prompt_template, DataProcessorConfig processor_config,
+      bool constrained_decoding_enabled = false,
+      bool prefill_preface_on_init = false,
+      std::optional<ConstraintProviderConfig> constraint_provider_config =
+          std::nullopt,
+      std::vector<Channel> channels = {},
+      bool filter_channel_content_from_kv_cache = false,
+      bool return_error_on_parse_failure = true,
+      bool return_error_on_max_tokens_reached = false,
+      std::optional<ThinkingConfig> thinking_config = std::nullopt,
+      bool stream_tool_calls = false,
+      const std::string& stream_tool_calls_channel_name = "tool_call",
+      bool enable_rewinding = true)
       : session_config_(std::move(session_config)),
         preface_(std::move(preface)),
         prompt_template_(std::move(prompt_template)),
@@ -282,7 +358,12 @@ class ConversationConfig {
         channels_(std::move(channels)),
         filter_channel_content_from_kv_cache_(
             filter_channel_content_from_kv_cache),
-        return_error_on_parse_failure_(return_error_on_parse_failure) {}
+        return_error_on_parse_failure_(return_error_on_parse_failure),
+        return_error_on_max_tokens_reached_(return_error_on_max_tokens_reached),
+        thinking_config_(thinking_config),
+        stream_tool_calls_(stream_tool_calls),
+        stream_tool_calls_channel_name_(stream_tool_calls_channel_name),
+        enable_rewinding_(enable_rewinding) {}
 
   SessionConfig session_config_;
   Preface preface_;
@@ -294,6 +375,11 @@ class ConversationConfig {
   std::vector<Channel> channels_;
   bool filter_channel_content_from_kv_cache_;
   bool return_error_on_parse_failure_;
+  bool return_error_on_max_tokens_reached_;
+  std::optional<ThinkingConfig> thinking_config_;
+  bool stream_tool_calls_;
+  std::string stream_tool_calls_channel_name_;
+  bool enable_rewinding_;
 };
 
 // Optional arguments for sending a message to the LLM.
@@ -342,6 +428,17 @@ struct OptionalArgs {
   //   {.has_pending_message = false}));
   bool has_pending_message = false;
 
+  // The repetition penalty config to be used during decode.
+  std::optional<RepetitionPenaltyConfig> repetition_penalty_config =
+      std::nullopt;
+
+  // The no repeat ngram config to be used during decode.
+  std::optional<NoRepeatNgramConfig> no_repeat_ngram_config = std::nullopt;
+
+  // The suppress tokens config to be used during decode. This overrides the
+  // suppress tokens config in the ConversationConfig.
+  std::optional<SuppressTokensConfig> suppress_tokens_config = std::nullopt;
+
   // The constraint to be used for constrained decoding.
   std::optional<ConstraintArg> decoding_constraint = std::nullopt;
 
@@ -349,7 +446,9 @@ struct OptionalArgs {
   // don't need to provide this argument.
   std::optional<DataProcessorArguments> args = std::nullopt;
 
-  // The maximum number of tokens to generate during decode.
+  // The maximum number of tokens to generate during decode. For thinking
+  // models, both thinking (reasoning) tokens and the final response tokens
+  // count towards this limit.
   std::optional<int> max_output_tokens = std::nullopt;
 
   // The task group id for asynchronous tasks. If provided, the task
@@ -361,6 +460,10 @@ struct OptionalArgs {
   // context only applies to a single message and is merged with the extra
   // context provided in the Preface, overwriting existing keys.
   std::optional<nlohmann::ordered_json> extra_context = std::nullopt;
+
+  // The thinking configuration. If provided, this value overrides the default
+  // value in `ConversationConfig`.
+  std::optional<ThinkingConfig> thinking_config = std::nullopt;
 };
 
 // A multi-turn centric stateful Conversation API for high-level user
@@ -378,18 +481,18 @@ struct OptionalArgs {
 // Example usage:
 //
 //   // Create an Engine instance.
-//   ASSIGN_OR_RETURN(auto engine, Engine::Create(model_assets));
+//   ABSL_ASSIGN_OR_RETURN(auto engine, Engine::Create(model_assets));
 //
 //   // Create a ConversationConfig instance from the Engine.
-//   ASSIGN_OR_RETURN(auto conversation_config,
+//   ABSL_ASSIGN_OR_RETURN(auto conversation_config,
 //                    ConversationConfig::CreateDefault(*engine));
 //
 //   // Create a Conversation instance.
-//   ASSIGN_OR_RETURN(auto conversation,
+//   ABSL_ASSIGN_OR_RETURN(auto conversation,
 //       Conversation::Create(*engine, conversation_config));
 //
 //   // Send a message to the LLM and returns the complete message.
-//   ASSIGN_OR_RETURN(const Message message,
+//   ABSL_ASSIGN_OR_RETURN(const Message message,
 //                    conversation->SendMessage(Message{
 //                        {"role", "user"}, {"content", "Hello world!"}}));
 //
@@ -531,8 +634,11 @@ class Conversation {
   absl::StatusOr<BenchmarkInfo*> GetMutableBenchmarkInfo();
 
   // Cancels the ongoing inference process, for asynchronous inference.
-  // Note: the underlying Session is not rollbacked, so the message
-  // from the user is actually sent to the LLM and processed for prefill.
+  //
+  // NOTE: Reusing the Conversation object after calling CancelProcess() is
+  // neither recommended nor supported. Calling CancelProcess() leaves the
+  // underlying session poisoned, and any subsequent calls to SendMessageAsync
+  // on the same Conversation will fail.
   void CancelProcess();
 
   // Clones the conversation. The cloned conversation will be independent of the
@@ -557,6 +663,18 @@ class Conversation {
   // internally.
   absl::StatusOr<std::string> RenderMessageIntoString(
       const Message& message, OptionalArgs optional_args);
+
+  // Renders the preface into a string for testing and logging purposes.
+  absl::StatusOr<std::string> RenderPrefaceIntoString(
+      OptionalArgs optional_args);
+
+  // Returns debug info for this conversation's underlying session.
+  std::optional<SessionDebugInfo> GetSessionDebugInfo() const {
+    if (session_ != nullptr) {
+      return session_->GetSessionDebugInfo();
+    }
+    return std::nullopt;
+  }
 
  private:
   explicit Conversation(
@@ -584,9 +702,27 @@ class Conversation {
   absl::StatusOr<std::string> GetSingleTurnTextFromSingleTurnTemplate(
       const Message& message, const OptionalArgs& optional_args);
 
+  // Creates a `DecodeConfig` from the session/conversation parameters and
+  // optional runtime overrides.
+  //
+  // `open_channel_name`: Indicates the name of an open channel tag right at the
+  // end of the prefilled prompt text (if any), as determined by checking
+  // whether the rendered prompt ends after a channel start tag (e.g.
+  // `<think>\n`) without a matching end tag. When sending a message where the
+  // thinking channel is prefilled (`open_channel_name ==
+  // thinking_channel->channel_name`), this should be passed so that
+  // `SetThinkingStartTokenIds` is configured empty (`{}`) and the constrained
+  // decoder starts immediately in active thinking state without waiting for
+  // duplicate start tokens.
   absl::StatusOr<DecodeConfig> CreateDecodeConfig(
+      std::optional<RepetitionPenaltyConfig> repetition_penalty_config =
+          std::nullopt,
+      std::optional<NoRepeatNgramConfig> no_repeat_ngram_config = std::nullopt,
+      std::optional<SuppressTokensConfig> suppress_tokens_config = std::nullopt,
       std::optional<ConstraintArg> decoding_constraint = std::nullopt,
-      std::optional<int> max_output_tokens = std::nullopt);
+      std::optional<int> max_output_tokens = std::nullopt,
+      std::optional<ThinkingConfig> thinking_config = std::nullopt,
+      std::optional<absl::string_view> open_channel_name = std::nullopt);
 
   absl::StatusOr<std::vector<InputData>> GetPrefaceInputDataVector();
 
@@ -640,6 +776,10 @@ class Conversation {
   absl::StatusOr<std::vector<InputData>> RewindAndGetInputDataVector(
       const OptionalArgs& optional_args = OptionalArgs());
 
+  // Applies the prompt template to the given input. This function will strip
+  // heavy blobs from the input before applying the template.
+  absl::StatusOr<std::string> ApplyTemplate(PromptTemplateInput& input);
+
   // Keep a reference to the creator engine to enable access to the shared
   // resources that might be required for features like cloning.
   Engine& engine_;
@@ -655,7 +795,7 @@ class Conversation {
   std::vector<Message> history_ ABSL_GUARDED_BY(history_mutex_);
 
   // Whether the current conversation is in message appending state.
-  bool is_appending_message_ = false;
+  bool is_appending_message_ ABSL_GUARDED_BY(history_mutex_) = false;
 
   // Mutex for task_controllers_.
   mutable absl::Mutex task_controllers_mutex_;

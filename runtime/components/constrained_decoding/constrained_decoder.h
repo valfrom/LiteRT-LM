@@ -41,9 +41,9 @@ namespace litert::lm {
 //   ConstrainedDecoder decoder(constraint, batch_size);
 //   while (!done) {
 //     TensorBuffer logits = Decode(...);
-//     RETURN_IF_ERROR(decoder.MaskLogits(logits));
+//     ABSL_RETURN_IF_ERROR(decoder.ProcessLogits(logits));
 //     TensorBuffer next_tokens = sampler.Sample(logits);
-//     RETURN_IF_ERROR(decoder.UpdateConstraintState(next_tokens));
+//     ABSL_RETURN_IF_ERROR(decoder.UpdateState(next_tokens));
 //   }
 class ConstrainedDecoder {
  public:
@@ -57,8 +57,27 @@ class ConstrainedDecoder {
     constraint_states_.reserve(batch_size_);
     std::generate_n(std::back_inserter(constraint_states_), batch_size_,
                     [&]() { return constraint_->Start(); });
-  };
-  virtual ~ConstrainedDecoder() = default;
+  }
+  ~ConstrainedDecoder() = default;
+
+  // Masks the input logits tensor based on the current constraint state of
+  // each sequence in the batch.
+  // For each sequence, tokens disallowed by the constraint in the current state
+  // will have their corresponding logit values set to -inf.
+  //
+  // @param logits A tensor of shape [batch_size, sequence_length, vocab_size]
+  // containing the logits for the next token prediction. This tensor is
+  // modified in-place.
+  // @return Ok if masking was successful, or an error if dimensions are
+  // incorrect or masking fails.
+  absl::Status ProcessLogits(TensorBuffer& logits);
+
+  // Same as above, but takes a span of logits instead of a tensor buffer.
+  absl::Status ProcessLogits(absl::Span<float> logits,
+                             absl::Span<const Layout::Dim> logits_dims);
+
+  absl::Status ProcessLogits(absl::Span<tflite::half> logits,
+                             absl::Span<const Layout::Dim> logits_dims);
 
   // Updates the internal constraint state for each sequence in the batch based
   // on the newly selected tokens. If a sequence reaches an end state
@@ -69,30 +88,10 @@ class ConstrainedDecoder {
   // current step.
   // @return Ok if the states were updated successfully, or an error if any
   // token is invalid for its corresponding state.
-  absl::Status UpdateConstraintState(
-      const ::litert::TensorBuffer& next_token_ids);
+  absl::Status UpdateState(const TensorBuffer& next_token_ids);
 
   // Same as above, but takes a span of token ids instead of a tensor buffer.
-  absl::Status UpdateConstraintState(absl::Span<int> next_token_ids);
-
-  // Masks the input logits tensor based on the current constraint state of
-  // each sequence in the batch.
-  // For each sequence, tokens disallowed by the constraint in the current state
-  // will have their corresponding logit values set to -inf.
-  //
-  // @param logits A tensor of shape [batch_size, sequence_length, vocab_size]
-  // containing the logits for the next token prediction. This tensor is
-  // modified in-place.
-  // @return Ok if masking was successful, or an error if dimensionss are
-  // incorrect or masking fails.
-  absl::Status MaskLogits(::litert::TensorBuffer& logits);
-
-  // Same as above, but takes a span of logits instead of a tensor buffer.
-  absl::Status MaskLogits(absl::Span<float> logits,
-                          absl::Span<const ::litert::Layout::Dim> logits_dims);
-
-  absl::Status MaskLogits(absl::Span<tflite::half> logits,
-                          absl::Span<const ::litert::Layout::Dim> logits_dims);
+  absl::Status UpdateState(absl::Span<int> next_token_ids);
 
   // Returns a pointer to the constraint.
   Constraint* GetConstraint() const { return constraint_; }

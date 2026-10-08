@@ -7,6 +7,7 @@ OUT_DIR="${OUT_DIR:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/release-artifacts/$TA
 WORK_DIR="${WORK_DIR:-$OUT_DIR/work}"
 BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/bazel-output-base}"
 BAZEL_LINK_PREFIX="${BAZEL_LINK_PREFIX:-/Volumes/XBOX/tmp/LiteRT-LM/eval_pause/bazel-links/}"
+BAZEL_OUTPUT_USER_ROOT="${BAZEL_OUTPUT_USER_ROOT:-/Volumes/XBOX/tmp/LiteRT-LM/bazel-user}"
 BAZEL_VERSION="$(bazel --version)"
 IOS_MINIMUM_OS_VERSION="16.0"
 
@@ -18,7 +19,7 @@ fi
 mkdir -p "$OUT_DIR" "$WORK_DIR" "$(dirname "$BAZEL_LINK_PREFIX")"
 
 cd "$ROOT"
-bazel --output_base="$BAZEL_OUTPUT_BASE" build --symlink_prefix="$BAZEL_LINK_PREFIX" //swift:CLiteRTLM
+bazel --output_user_root="$BAZEL_OUTPUT_USER_ROOT" --output_base="$BAZEL_OUTPUT_BASE" build --symlink_prefix="$BAZEL_LINK_PREFIX" --jobs="${BAZEL_JOBS:-20}" //swift:CLiteRTLM
 
 CLITERT_WORK_DIR="$WORK_DIR/CLiteRTLM"
 mkdir -p "$CLITERT_WORK_DIR"
@@ -75,7 +76,7 @@ done
 xcrun swift -module-cache-path "$WORK_DIR/swift-module-cache" \
   "$ROOT/swiftpm/fix_gtm_logger_classes.swift" "${clitert_binaries[@]}"
 
-(cd "$CLITERT_WORK_DIR" && zip -r -X "$OUT_DIR/CLiteRTLM.xcframework.zip" CLiteRTLM.xcframework) >/dev/null
+(cd "$CLITERT_WORK_DIR" && zip -9 -r -X "$OUT_DIR/CLiteRTLM.xcframework.zip" CLiteRTLM.xcframework) >/dev/null
 
 create_framework() {
   local name="$1"
@@ -160,7 +161,7 @@ for name in GemmaModelConstraintProvider LiteRt LiteRtMetalAccelerator LiteRtTop
   xcrun swift -module-cache-path "$WORK_DIR/swift-module-cache" \
     "$ROOT/swiftpm/fix_gtm_logger_classes.swift" "${framework_binaries[@]}"
   xcodebuild -create-xcframework "${args[@]}" -output "$WORK_DIR/${name}.xcframework"
-  (cd "$WORK_DIR" && zip -r -X "$OUT_DIR/${name}.xcframework.zip" "${name}.xcframework") >/dev/null
+  (cd "$WORK_DIR" && zip -9 -r -X "$OUT_DIR/${name}.xcframework.zip" "${name}.xcframework") >/dev/null
 done
 
 cd "$OUT_DIR"

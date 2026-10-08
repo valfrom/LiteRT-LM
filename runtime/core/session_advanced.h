@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
@@ -32,13 +33,14 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "litert/cc/litert_environment.h"  // from @litert
 #include "runtime/core/eval_pause.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/proto/sampler_params.pb.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 
@@ -85,19 +87,30 @@ class SessionAdvanced : public SessionInterface {
   // Creates a SessionAdvanced object.
   static absl::StatusOr<std::unique_ptr<SessionAdvanced>> Create(
       std::weak_ptr<ExecutionManager> execution_manager,
-      Tokenizer* absl_nonnull tokenizer, const SessionConfig& session_config,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
-      std::atomic<int>* living_sessions_count = nullptr);
+      std::atomic<int>* living_sessions_count = nullptr,
+      const Engine* engine = nullptr);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
   // done and release the session from the execution manager.
   ~SessionAdvanced() override;
 
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::StatusOr<Responses> GenerateContent(
       const std::vector<InputData>& contents) override;
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override;
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -131,6 +144,11 @@ class SessionAdvanced : public SessionInterface {
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
+  absl::StatusOr<std::unique_ptr<TaskController>> PrefillPreprocessedContents(
+      std::vector<InputData> preprocessed_contents,
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
   absl::StatusOr<Responses> RunDecode() override;
 
   absl::StatusOr<Responses> RunDecode(
@@ -155,17 +173,25 @@ class SessionAdvanced : public SessionInterface {
   // step number.
   absl::Status SaveCheckpoint(absl::string_view label) override;
 
-  // Rewinds the session to the given checkpoint and then returns the current
-  // step.
+  // Rewinds the session to the given checkpoint.
   absl::Status RewindToCheckpoint(absl::string_view label) override;
+
+  // Rewinds the session to a specific step number.
+  absl::Status RewindToStep(int step) override;
 
   // Get the current step of the session.
   absl::StatusOr<int> GetCurrentStep() const override;
 
+  // Cancels the ongoing inference process.
+  //
+  // NOTE: Reusing the session after calling CancelProcess() is neither
+  // recommended nor supported. Calling CancelProcess() leaves the session
+  // state poisoned, and subsequent operations may fail or behave incorrectly.
+  //
   // TODO(b/450903294): Add rollback history support for Session and
   // Conversation.
   void CancelProcess() override {
-    ABSL_LOG(INFO) << "SessionAdvanced::CancelProcess";
+    ABSL_VLOG(1) << "SessionAdvanced::CancelProcess";
     GlobalEvalPauseController().Notify();
     auto execution_manager_lock = execution_manager_.lock();
     if (execution_manager_lock == nullptr) {
@@ -181,6 +207,13 @@ class SessionAdvanced : public SessionInterface {
   const SessionConfig& GetSessionConfig() const override {
     return session_info_->session_config;
   }
+
+  // Returns debug info for this session.
+  std::optional<SessionDebugInfo> GetSessionDebugInfo() const override;
+
+  // Returns the LiteRT environment associated with this session's engine,
+  // if available.
+  absl::StatusOr<const ::litert::Environment*> GetEnvironment() const override;
 
   absl::Status WaitUntilDone() override {
     auto execution_manager_lock = execution_manager_.lock();
@@ -201,7 +234,7 @@ class SessionAdvanced : public SessionInterface {
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
- private:
+ protected:
   // The state of the session.
   // * `kFresh` means the session is just created and
   //   hasn't been prefilled yet.
@@ -217,25 +250,27 @@ class SessionAdvanced : public SessionInterface {
 
   explicit SessionAdvanced(SessionId session_id,
                            std::weak_ptr<ExecutionManager> execution_manager,
-                           Tokenizer* absl_nonnull tokenizer,
+                           support::Tokenizer* absl_nonnull tokenizer,
                            std::shared_ptr<const SessionInfo> session_info,
                            SessionState session_state = SessionState::kFresh,
                            absl::flat_hash_set<TaskId> last_task_ids = {},
-                           std::atomic<int>* living_sessions_count = nullptr)
+                           std::atomic<int>* living_sessions_count = nullptr,
+                           const Engine* engine = nullptr)
       : session_id_(session_id),
         execution_manager_(execution_manager),
         tokenizer_(tokenizer),
         session_info_(session_info),
         session_state_(session_state),
         last_task_ids_(last_task_ids),
-        living_sessions_count_(living_sessions_count) {
+        living_sessions_count_(living_sessions_count),
+        engine_(engine) {
     if (living_sessions_count_) {
       (*living_sessions_count_)++;
     }
   }
 
   // The implementation of CloneAsync which assumes mutex_ is locked.
-  absl::StatusOr<std::unique_ptr<SessionInterface>> CloneAsyncLocked(
+  virtual absl::StatusOr<std::unique_ptr<SessionInterface>> CloneAsyncLocked(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
@@ -246,7 +281,7 @@ class SessionAdvanced : public SessionInterface {
   std::weak_ptr<ExecutionManager> execution_manager_;
 
   // The tokenizer used for the session.
-  Tokenizer* absl_nonnull tokenizer_;
+  support::Tokenizer* absl_nonnull tokenizer_;
 
   // The session info used for the session.
   std::shared_ptr<const SessionInfo> session_info_;
@@ -260,6 +295,7 @@ class SessionAdvanced : public SessionInterface {
   struct CheckpointInfo {
     int step;
     SessionState state;
+    absl::flat_hash_set<TaskId> last_task_ids;
   };
 
   // The checkpoint map for the session.
@@ -271,6 +307,9 @@ class SessionAdvanced : public SessionInterface {
 
   // Pointer to the counter of living sessions in Engine.
   std::atomic<int>* living_sessions_count_;
+
+  // Non-owning pointer to the Engine that created this session.
+  const Engine* engine_;
 };
 
 }  // namespace litert::lm

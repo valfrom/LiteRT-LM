@@ -29,6 +29,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/internal/scoped_file.h"  // from @litert
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
@@ -56,6 +57,14 @@ class EmbeddingLookupText : public EmbeddingLookup {
   // signature_key is not provided, the first signature will be used by default.
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
       litert::Environment& env, const litert::Model* absl_nonnull model,
+      std::optional<std::string> signature_key = std::nullopt,
+      std::optional<ScopedFile> external_weight_file = std::nullopt,
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
+
+  static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
+      litert::Environment& env, litert::CompiledModel compiled_model,
       std::optional<std::string> signature_key = std::nullopt);
 
   // For a given token, looks up the embedding and stores it in the
@@ -115,10 +124,29 @@ class EmbeddingLookupText : public EmbeddingLookup {
   }
 
  protected:
+  EmbeddingLookupText(
+      litert::Environment& env, const litert::Model* model,
+      std::optional<std::string> signature_key,
+      std::optional<ScopedFile> external_weight_file,
+      litert::Options::ScopedWeightSectionMap external_weight_sections,
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr)
+      : env_(env),
+        model_(model),
+        signature_key_(std::move(signature_key)),
+        external_weight_file_(std::move(external_weight_file)),
+        external_weight_sections_(std::move(external_weight_sections)),
+        weight_in_memory_map_(weight_in_memory_map) {}
+
+  // Creates a EmbeddingLookupText instance with an already compiled LiteRT
+  // model. Used in the streaming model loading path.
   EmbeddingLookupText(litert::Environment& env,
-                      const litert::Model* absl_nonnull model,
+                      litert::CompiledModel compiled_model,
                       std::optional<std::string> signature_key)
-      : env_(env), model_(*model), signature_key_(signature_key) {}
+      : env_(env),
+        model_(nullptr),
+        compiled_model_(std::move(compiled_model)),
+        signature_key_(std::move(signature_key)) {}
 
   // Loads the provided model. This must be called before Lookup.
   absl::Status Initialize();
@@ -130,8 +158,8 @@ class EmbeddingLookupText : public EmbeddingLookup {
   // The environment for the embedding lookup.
   litert::Environment& env_;
   // The model for the embedding lookup. The actual model instance is owned by
-  // the model resources.
-  const litert::Model& model_;
+  // the model resources. Can be null if created with pre-compiled model.
+  const litert::Model* model_;
   // The compiled model for the embedding model.
   std::optional<litert::CompiledModel> compiled_model_;
 
@@ -153,6 +181,13 @@ class EmbeddingLookupText : public EmbeddingLookup {
   // The signature key to use for the embedding model. If not provided, the
   // first signature key will be used.
   std::optional<std::string> signature_key_;
+
+  // Optional external weights section for embedding lookup models whose
+  // constants have been moved into the LiteRT-LM container.
+  std::optional<ScopedFile> external_weight_file_;
+  litert::Options::ScopedWeightSectionMap external_weight_sections_;
+  const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+      weight_in_memory_map_ = nullptr;
 };
 
 }  // namespace litert::lm

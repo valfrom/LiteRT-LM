@@ -20,7 +20,6 @@
 #include <memory>
 #include <optional>
 #include <tuple>
-#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
@@ -32,19 +31,25 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "litert/cc/litert_environment.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
-#include "runtime/components/sampler.h"
-#include "runtime/components/tokenizer.h"
+#include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/llm_executor.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/framework/resource_management/resource_manager.h"
 
 namespace litert::lm {
+
+class RuntimeDebugger;
 
 // An ExecutionManager implementation for single-threaded management. This
 // implementation is not thread-safe.
@@ -71,7 +76,9 @@ class SerialExecutionManager : public ExecutionManager {
       std::unique_ptr<AudioExecutorSettings> absl_nullable
       audio_executor_settings,
       ::litert::Environment* absl_nullable litert_env,
-      std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr);
+      std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr,
+      std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger =
+          nullptr);
 
   ~SerialExecutionManager() override;
 
@@ -101,6 +108,9 @@ class SerialExecutionManager : public ExecutionManager {
 
   // Releases the session with the given session ID.
   absl::Status ReleaseSession(SessionId session_id) override;
+
+  absl::Status UpdateGpuEnableMetalResidencySet(
+      bool enable_metal_residency_set) override;
 
   // Cancels all tasks in the session with the given session ID.
   absl::Status CancelAllTasksInSession(SessionId session_id) override;
@@ -144,6 +154,10 @@ class SerialExecutionManager : public ExecutionManager {
   // - task_id: The task ID of the task.
   // - dep_tasks: The dependent tasks that should be done before the decode
   //   task starts.
+  // - repetition_penalty_config: The repetition penalty config for the decode
+  //   task.
+  // - no_repeat_ngram_config: The no repeat ngram config for the decode task.
+  // - suppress_tokens_config: The suppress tokens config for the decode task.
   // - constraint: The constraint for the decode task.
   // - cancelled: The cancelled flag for the decode task.
   // - callback: The callback function.
@@ -151,10 +165,16 @@ class SerialExecutionManager : public ExecutionManager {
   absl::Status AddDecodeTask(
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
+      RepetitionPenaltyConfig repetition_penalty_config,
+      NoRepeatNgramConfig no_repeat_ngram_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
-      int max_output_tokens) override;
+      int max_output_tokens,
+      std::optional<int> thinking_token_budget = std::nullopt,
+      std::vector<int> thinking_start_token_ids = {},
+      std::vector<int> thinking_end_token_ids = {}) override;
 
   // Adds a clone session task to the execution manager.
   // - session_id: The ID of the session that created the task.
@@ -207,6 +227,20 @@ class SerialExecutionManager : public ExecutionManager {
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override;
 
+  // Synchronously encodes an audio spectrogram tensor into audio soft tokens
+  // within the context of the given session.
+  absl::StatusOr<ExecutorAudioData> EncodeAudio(
+      const SessionInfo& session_info,
+      const TensorBuffer& spectrogram_tensor) override;
+
+  // Resets the audio executor for the given session.
+  absl::Status ResetAudio(const SessionInfo& session_info) override;
+
+  // Flushes remaining buffered audio frames from the audio executor for the
+  // given session.
+  absl::StatusOr<ExecutorAudioData> FlushAudio(
+      const SessionInfo& session_info) override;
+
   // Returns the vision executor properties.
   absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
       const override;
@@ -215,7 +249,9 @@ class SerialExecutionManager : public ExecutionManager {
   explicit SerialExecutionManager(
       Tokenizer* absl_nonnull tokenizer,
       std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
-      ::litert::Environment* absl_nullable litert_env);
+      ::litert::Environment* absl_nullable litert_env,
+      std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger =
+          nullptr);
 
   // Creates a task with the given task ID, task, dependent tasks, and callback.
   // - session_id: The ID of the session that created the task.
@@ -300,6 +336,8 @@ class SerialExecutionManager : public ExecutionManager {
   std::unique_ptr<ResourceManager> resource_manager_;
   // The LIRTER environment used for creating the LLM context.
   ::litert::Environment* litert_env_;
+  // Process-wide debugger telemetry handle (borrowed/unowned).
+  std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger_ = nullptr;
 
   // The session ID.
   SessionId next_session_id_ = 0;

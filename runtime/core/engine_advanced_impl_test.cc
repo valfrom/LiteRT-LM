@@ -27,8 +27,10 @@
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "runtime/components/model_resources.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -52,8 +54,8 @@ constexpr int kMaxNumTokens = 16;
 
 absl::StatusOr<std::unique_ptr<Engine>> CreateEngine(
     EngineSettings engine_settings) {
-  ASSIGN_OR_RETURN(std::vector<EngineFactory::EngineType> engine_types,
-                   EngineFactory::Instance().ListEngineTypes());
+  ABSL_ASSIGN_OR_RETURN(std::vector<EngineFactory::EngineType> engine_types,
+                        EngineFactory::Instance().ListEngineTypes());
   RET_CHECK_EQ(engine_types.size(), 1);
   return EngineFactory::CreateDefault(std::move(engine_settings));
 }
@@ -73,6 +75,11 @@ TEST(EngineTest, CreateEngine_WithoutCache) {
 
   absl::StatusOr<std::unique_ptr<Engine>> llm = CreateEngine(*engine_settings);
   ABSL_CHECK_OK(llm);
+
+  const Tokenizer& default_tok = (*llm)->GetTokenizer();
+  auto prefill_tok = (*llm)->GetTokenizer(ModelType::kTfLitePrefillDecode);
+  ASSERT_OK(prefill_tok);
+  EXPECT_EQ(prefill_tok.value(), &default_tok);
 
   absl::StatusOr<std::unique_ptr<Engine::Session>> session =
       (*llm)->CreateSession(SessionConfig::CreateDefault());
@@ -166,6 +173,7 @@ TEST(EngineTest, CreateEngine_WithCache) {
   auto cache_path = std::filesystem::path(::testing::TempDir()) /
                     absl::StrCat("cache-", std::rand());
   std::filesystem::remove_all(cache_path);
+  std::filesystem::create_directories(cache_path);
   absl::Cleanup remove_cache = [cache_path] {
     std::filesystem::remove_all(cache_path);
   };
@@ -416,7 +424,126 @@ TEST(EngineTest, CreateEngine_FailsNoAudioModel) {
                   "TF_LITE_AUDIO_ENCODER_HW not found in the model."));
 }
 
+TEST(EngineTest,
+     CreateEngine_MaxVisionTokensPerImage_NoVisionSettingsSucceeds) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings =
+      EngineSettings::CreateDefault(*model_assets, Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+  engine_settings->SetMaxVisionTokensPerImage(200);
+
+  EXPECT_OK(CreateEngine(*engine_settings));
+}
+
+TEST(EngineTest, CreateEngine_MaxVisionTokensPerImage_InvalidValueFails) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings = EngineSettings::CreateDefault(
+      *model_assets, Backend::CPU, /*vision_backend=*/Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+  engine_settings->SetMaxVisionTokensPerImage(-5);
+
+  EXPECT_THAT(
+      CreateEngine(*engine_settings),
+      testing::status::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          testing::HasSubstr("max_vision_tokens_per_image must be positive")));
+}
+
+TEST(EngineTest,
+     CreateEngine_VisionExecutorSettings_WithoutMaxVisionTokensPerImage) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings = EngineSettings::CreateDefault(
+      *model_assets, Backend::CPU, /*vision_backend=*/Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+
+  ASSERT_OK_AND_ASSIGN(auto llm, CreateEngine(*engine_settings));
+  EXPECT_NE(llm, nullptr);
+}
+
+TEST(EngineTest,
+     CreateEngine_MaxVisionTokensPerImageIgnoredForUnsupportedModel) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings = EngineSettings::CreateDefault(
+      *model_assets, Backend::CPU, /*vision_backend=*/Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+  engine_settings->SetMaxVisionTokensPerImage(280);
+
+  ASSERT_OK_AND_ASSIGN(auto llm, CreateEngine(*engine_settings));
+  EXPECT_NE(llm, nullptr);
+}
+
 // TODO (b/397975034): Add more tests for Engine.
+
+TEST(EngineTest, UpdateGpuEnableMetalResidencySet) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings =
+      EngineSettings::CreateDefault(*model_assets, Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+
+  absl::StatusOr<std::unique_ptr<Engine>> llm = CreateEngine(*engine_settings);
+  ASSERT_OK(llm);
+
+  EXPECT_OK((*llm)->UpdateGpuEnableMetalResidencySet(true));
+  EXPECT_OK((*llm)->UpdateGpuEnableMetalResidencySet(false));
+}
+
+TEST(EngineTest, GetEnvironmentReturnsValidEnvironment) {
+  auto task_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm_new_metadata.task";
+  auto model_assets = ModelAssets::Create(task_path.string());
+  ASSERT_OK(model_assets);
+  auto engine_settings =
+      EngineSettings::CreateDefault(*model_assets, Backend::CPU);
+  ASSERT_OK(engine_settings);
+  engine_settings->GetMutableMainExecutorSettings().SetMaxNumTokens(
+      kMaxNumTokens);
+  engine_settings->GetMutableMainExecutorSettings().SetCacheDir(":nocache");
+
+  ASSERT_OK_AND_ASSIGN(auto engine, CreateEngine(*engine_settings));
+  ASSERT_OK_AND_ASSIGN(const auto* env, engine->GetEnvironment());
+  EXPECT_NE(env, nullptr);
+
+  ASSERT_OK_AND_ASSIGN(auto session,
+                       engine->CreateSession(SessionConfig::CreateDefault()));
+  ASSERT_OK_AND_ASSIGN(const auto* session_env, session->GetEnvironment());
+  EXPECT_EQ(session_env, env);
+}
 
 }  // namespace
 }  // namespace litert::lm

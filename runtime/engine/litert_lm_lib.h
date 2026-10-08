@@ -21,17 +21,22 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "absl/base/log_severity.h"  // from @com_google_absl
+#include "absl/container/btree_map.h"  // from @com_google_absl
 #include "absl/log/log_entry.h"  // from @com_google_absl
 #include "absl/log/log_sink.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -72,18 +77,25 @@ struct LiteRtLmSettings {
   std::optional<std::string> audio_backend = std::nullopt;
   std::string sampler_backend = "";
   std::string model_path;
+  std::optional<std::string> model_name = std::nullopt;
   bool load_model_from_descriptor = false;
   std::string input_prompt = "What is the tallest building in the world?";
   std::optional<std::string> expected_output = std::nullopt;
   std::optional<std::string> log_sink_file = std::nullopt;
   int max_num_tokens = 0;
+  // The maximum number of tokens to generate. For thinking models, both
+  // thinking (reasoning) tokens and the final response tokens count towards
+  // this limit.
   int max_output_tokens = -1;
   int max_num_images = 0;
   int visual_token_budget = -1;
   absl::LogSeverity min_log_level = absl::LogSeverity::kInfo;
   std::set<int> prefill_batch_sizes;
+  // Empty preserves the model's default signature set.
+  std::vector<std::string> selected_signatures;
   int num_output_candidates = 1;
   bool benchmark = false;
+  bool enable_profiling = false;
   int benchmark_prefill_tokens = 0;
   int benchmark_decode_tokens = 0;
   bool async = true;
@@ -91,6 +103,8 @@ struct LiteRtLmSettings {
   bool force_f32 = false;
   bool multi_turns = false;
   int num_cpu_threads = 0;
+  // Delegate supported CPU operations to YNNPACK before XNNPACK.
+  bool enable_ynnpack = false;
   // Set external tensor mode false by default since it runs slightly faster
   // during decode as the layout changes optimized for GPU inference is done by
   // GPU, not by CPU.
@@ -101,7 +115,10 @@ struct LiteRtLmSettings {
   int num_logits_to_print_after_decode = 0;
   std::optional<std::string> score_target_text = std::nullopt;
   bool gpu_madvise_original_shared_tensors = true;
+  bool gpu_enable_metal_residency_set = false;
   bool disable_cache = false;
+  bool disable_weight_cache = false;
+  bool disable_gpu_program_cache = false;
   std::string cache_dir = "";
   int prefill_chunk_size = -1;
   std::string preferred_device_substr = "";
@@ -119,6 +136,10 @@ struct LiteRtLmSettings {
   bool sampler_handles_input = true;
   ConvType conv_type = ConvType::kAuto;
   bool cache_compiled_shaders_only = false;
+  RepetitionPenaltyConfig repetition_penalty_config =
+      RepetitionPenaltyConfig::Default();
+  NoRepeatNgramConfig no_repeat_ngram_config = NoRepeatNgramConfig::Default();
+  SuppressTokensConfig suppress_tokens_config = SuppressTokensConfig::Default();
   std::string constraint_regex = "";
   bool use_submodel = false;
   bool enable_speculative_decoding = false;
@@ -127,6 +148,7 @@ struct LiteRtLmSettings {
   bool use_hw_cache_update_for_npu = true;
   bool use_hw_ple_for_npu = true;
   bool enable_npu_debug_logging = false;
+  bool disable_input_prompt_as_hint = false;
 };
 
 struct LitertLmMetrics {
@@ -134,6 +156,33 @@ struct LitertLmMetrics {
   float peak_mem_mb = 0.0f;
   float peak_private_mb = 0.0f;
 };
+
+// Aggregated (median) statistics of the metrics collected over multiple
+// iterations of the same benchmark. Metrics which were not reported by any
+// iteration are left empty / unset.
+struct AggregatedLitertLmMetrics {
+  // The number of iterations the statistics are computed from.
+  int num_iterations = 0;
+  // Median duration of each initialization phase, keyed by the phase name.
+  absl::btree_map<std::string, absl::Duration> init_phases;
+  // Median duration of each profiling mark, keyed by the mark name.
+  absl::btree_map<std::string, absl::Duration> mark_durations;
+  // Median time to the first token, in seconds.
+  std::optional<double> time_to_first_token_sec;
+  // Median prefill / decode speed, in tokens per second, indexed by the turn
+  // index within an iteration.
+  std::vector<double> prefill_tokens_per_sec;
+  std::vector<double> decode_tokens_per_sec;
+  // Median peak memory usage, in MB.
+  std::optional<float> peak_mem_mb;
+  std::optional<float> peak_private_mb;
+};
+
+// Computes the median of each benchmark metric across the per-iteration
+// metrics collected by RunLiteRtLm. For an even number of values, the median is
+// the average of the two middle values.
+AggregatedLitertLmMetrics ComputeMedianMetrics(
+    const std::vector<LitertLmMetrics>& metrics);
 
 // Builds the content list from the input data.
 absl::StatusOr<nlohmann::json> BuildContentList(
@@ -155,6 +204,26 @@ SessionConfig CreateSessionConfig(const LiteRtLmSettings& settings);
 // the inference. Results from each iteration is saved in the vector.
 absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
                          std::vector<LitertLmMetrics>* metrics = nullptr);
+
+// Returns true if stdout is a TTY and colors should be used.
+bool UseColor();
+
+// Prints a JSON-formatted message to stdout and captures the text content.
+// Handles streaming and non-streaming modes, as well as multiple channels
+// (e.g. thinking vs final answer) and applies color coding if UseColor() is
+// true.
+//
+// Parameters:
+//   - message: The JSON message to print.
+//   - captured_output: Stream to collect the raw text content (without tags or
+//   colors).
+//   - active_channel: In streaming mode, tracks the currently active channel.
+//                     Must be persisted between calls for the same stream.
+//   - streaming: Set to true if printing chunks as they arrive.
+absl::Status PrintMessage(const nlohmann::ordered_json& message,
+                          std::stringstream& captured_output,
+                          std::string* active_channel = nullptr,
+                          bool streaming = false);
 
 }  // namespace lm
 }  // namespace litert

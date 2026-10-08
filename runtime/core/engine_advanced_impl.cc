@@ -21,38 +21,77 @@
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/log/check.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
-#include "litert/cc/litert_macros.h"  // from @litert
+#include "litert/cc/litert_environment.h"  // from @litert
 #include "runtime/components/model_resources.h"
-#include "runtime/components/tokenizer.h"
+#include "runtime/core/audio_session_advanced.h"
 #include "runtime/core/session_advanced.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor_settings.h"
-#include "runtime/executor/audio_executor_utils.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor_utils.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/litert_compiled_model_executor_utils.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/llm_litert_compiled_model_executor_factory.h"
-#include "runtime/executor/magic_number_configs_helper.h"
-#include "runtime/executor/vision_executor_settings.h"
-#include "runtime/executor/vision_executor_utils.h"
+#include "runtime/executor/model_signature_utils.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
+#include "runtime/executor/vision/vision_executor_utils.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/framework/resource_management/serial_execution_manager.h"
 #include "runtime/framework/resource_management/threaded_execution_manager.h"
 #include "runtime/proto/llm_metadata.pb.h"
-#include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/litert_util.h"
-#include "runtime/util/logging.h"
 #include "runtime/util/status_macros.h"  // NOLINT
+#include "support/tokenizer/tokenizer.h"
+
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+#include "runtime/util/runtime_debugger.h"
+#endif  // defined(LITERT_LM_DEBUGGER_ENABLED)
 
 namespace litert::lm {
+namespace {
+
+std::optional<int> GetVisionTokensPerImageFromMetadata(
+    const proto::LlmMetadata* llm_metadata) {
+  if (llm_metadata == nullptr || !llm_metadata->has_llm_model_type()) {
+    return std::nullopt;
+  }
+  const auto& model_type = llm_metadata->llm_model_type();
+  int max_num_patches = 0;
+  int pooling_kernel_size = 1;
+  if (model_type.has_gemma4()) {
+    max_num_patches = model_type.gemma4().max_num_patches();
+    pooling_kernel_size = model_type.gemma4().pooling_kernel_size() > 0
+                              ? model_type.gemma4().pooling_kernel_size()
+                              : 3;
+  } else if (model_type.has_generic_model()) {
+    max_num_patches = model_type.generic_model().max_num_patches();
+    if (model_type.generic_model().pooling_kernel_size() > 0) {
+      pooling_kernel_size = model_type.generic_model().pooling_kernel_size();
+    }
+  } else if (model_type.has_lfm2()) {
+    max_num_patches = model_type.lfm2().max_num_patches();
+    pooling_kernel_size = model_type.lfm2().pooling_kernel_size() > 0
+                              ? model_type.lfm2().pooling_kernel_size()
+                              : 2;
+  }
+  if (max_num_patches <= 0) {
+    return std::nullopt;
+  }
+  const int patch_num_shrink_factor = pooling_kernel_size * pooling_kernel_size;
+  return max_num_patches / patch_num_shrink_factor;
+}
+
+}  // namespace
 
 class EngineAdvancedImpl : public Engine {
  public:
@@ -68,6 +107,7 @@ class EngineAdvancedImpl : public Engine {
     }
 
     execution_manager_.reset();
+    owned_env_.reset();
     tokenizer_.reset();
     litert_model_resources_.reset();
   }
@@ -77,11 +117,13 @@ class EngineAdvancedImpl : public Engine {
 
   EngineAdvancedImpl(EngineSettings engine_settings,
                      std::unique_ptr<ModelResources> litert_model_resources,
+                     std::unique_ptr<OwnedEnvironment> owned_env,
                      std::unique_ptr<Tokenizer> tokenizer,
                      std::unique_ptr<ExecutionManager> execution_manager,
                      std::optional<BenchmarkInfo> benchmark_info)
       : engine_settings_(std::move(engine_settings)),
         litert_model_resources_(std::move(litert_model_resources)),
+        owned_env_(std::move(owned_env)),
         tokenizer_(std::move(tokenizer)),
         execution_manager_(std::move(execution_manager)),
         benchmark_info_(std::move(benchmark_info)) {}
@@ -94,30 +136,41 @@ class EngineAdvancedImpl : public Engine {
       // Each session will have its own benchmark info, which will be populated
       // with the session-specific information.
       session_benchmark_info = benchmark_info_;
-      RETURN_IF_ERROR(session_benchmark_info->TimeInitPhaseStart(
+      ABSL_RETURN_IF_ERROR(session_benchmark_info->TimeInitPhaseStart(
           BenchmarkInfo::InitPhase::kSession));
     }
 
     SessionConfig config = session_config;
     // TODO(b/418794726): Move this logics to be part of the SessionConfig
     // class.
-    RETURN_IF_ERROR(config.MaybeUpdateAndValidate(engine_settings_));
+    ABSL_RETURN_IF_ERROR(config.MaybeUpdateAndValidate(engine_settings_));
 
     if (litert_model_resources_ == nullptr) {
       return absl::FailedPreconditionError(
           "Model resources are not initialized.");
     }
 
-    ASSIGN_OR_RETURN(auto session,
-                     SessionAdvanced::Create(
-                         execution_manager_, tokenizer_.get(), config,
-                         std::move(session_benchmark_info), &living_sessions_));
+    std::unique_ptr<SessionAdvanced> session;
+    if (config.EnableAudioSessionAdvanced()) {
+      ABSL_ASSIGN_OR_RETURN(
+          session, AudioSessionAdvanced::Create(
+                       execution_manager_, tokenizer_.get(), config,
+                       std::move(session_benchmark_info), &living_sessions_,
+                       /*engine=*/this));
+    } else {
+      ABSL_ASSIGN_OR_RETURN(
+          session, SessionAdvanced::Create(
+                       execution_manager_, tokenizer_.get(), config,
+                       std::move(session_benchmark_info), &living_sessions_,
+                       /*engine=*/this));
+    }
 
     if (benchmark_info_.has_value()) {
       auto session_benchmark_info_or = session->GetMutableBenchmarkInfo();
       if (session_benchmark_info_or.ok()) {
-        RETURN_IF_ERROR(session_benchmark_info_or.value()->TimeInitPhaseEnd(
-            BenchmarkInfo::InitPhase::kSession));
+        ABSL_RETURN_IF_ERROR(
+            session_benchmark_info_or.value()->TimeInitPhaseEnd(
+                BenchmarkInfo::InitPhase::kSession));
       }
     }
     return session;
@@ -132,6 +185,21 @@ class EngineAdvancedImpl : public Engine {
 
   const Tokenizer& GetTokenizer() const override { return *tokenizer_; }
 
+  absl::StatusOr<const support::Tokenizer*> GetTokenizer(
+      ModelType model_type) const override {
+    if (model_type == ModelType::kTfLitePrefillDecode) {
+      if (!tokenizer_) {
+        return absl::NotFoundError("Primary tokenizer not initialized.");
+      }
+      return tokenizer_.get();
+    }
+    if (!litert_model_resources_) {
+      return absl::FailedPreconditionError(
+          "Model resources are not initialized.");
+    }
+    return litert_model_resources_->GetOrCreateTokenizer(model_type);
+  }
+
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
     return GetAudioExecutorPropertiesFromModelResources(
@@ -144,12 +212,28 @@ class EngineAdvancedImpl : public Engine {
         *litert_model_resources_);
   }
 
+  absl::Status UpdateGpuEnableMetalResidencySet(
+      bool enable_metal_residency_set) override {
+    return execution_manager_->UpdateGpuEnableMetalResidencySet(
+        enable_metal_residency_set);
+  }
+
+  absl::StatusOr<const ::litert::Environment*> GetEnvironment() const override {
+    if (owned_env_ == nullptr) {
+      return absl::NotFoundError("LiteRT environment is not available.");
+    }
+    return &owned_env_->env;
+  }
+
  private:
   // Stored engine settings.
   EngineSettings engine_settings_;
 
   // Model resources, which must outlive `executor_`.
   std::unique_ptr<ModelResources> litert_model_resources_;
+
+  // Owned environment, which must outlive `executor_`.
+  std::unique_ptr<OwnedEnvironment> owned_env_;
 
   // Tokenizer shared by all sessions.
   std::unique_ptr<Tokenizer> tokenizer_;
@@ -169,38 +253,91 @@ class EngineAdvancedImpl : public Engine {
 // Method to create Engine.
 absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
     EngineSettings engine_settings, absl::string_view input_prompt_as_hint) {
+
   std::optional<BenchmarkInfo> benchmark_info =
       engine_settings.IsBenchmarkEnabled()
           ? std::make_optional<BenchmarkInfo>(
                 engine_settings.GetBenchmarkParams().value())
           : std::nullopt;
 
+  const auto& advanced_settings =
+      engine_settings.GetMainExecutorSettings().GetAdvancedSettings();
+  const bool is_npu =
+      engine_settings.GetMainExecutorSettings().GetBackend() == Backend::NPU;
+  // Magic-number replacement mutates the model flatbuffer in place.
+  const bool enable_file_backed_model_loading =
+      is_npu && advanced_settings &&
+      !advanced_settings->configure_magic_numbers;
+
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         benchmark_info->TimeInitPhaseStart(BenchmarkInfo::InitPhase::kTotal));
-    RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
+    ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
         BenchmarkInfo::InitPhase::kModelAssets));
   }
   const auto& model_assets =
       engine_settings.GetMutableMainExecutorSettings().GetModelAssets();
-  ASSIGN_OR_RETURN(auto model_resources,
-                   BuildLiteRtCompiledModelResources(model_assets));
+  ABSL_ASSIGN_OR_RETURN(auto model_resources,
+                        BuildLiteRtCompiledModelResources(
+                            model_assets, enable_file_backed_model_loading,
+                            /*enable_file_backed_for_aot_npu=*/is_npu));
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(benchmark_info->TimeInitPhaseEnd(
+    ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseEnd(
         BenchmarkInfo::InitPhase::kModelAssets));
   }
 
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
+    ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
         BenchmarkInfo::InitPhase::kLlmMetadata));
   }
 
-  ASSIGN_OR_RETURN(auto* llm_metadata, model_resources->GetLlmMetadata());
+  ABSL_ASSIGN_OR_RETURN(const auto* llm_metadata,
+                        model_resources->GetLlmMetadata());
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(benchmark_info->TimeInitPhaseEnd(
+    ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseEnd(
         BenchmarkInfo::InitPhase::kLlmMetadata));
   }
-  bool hasLlmModelType = llm_metadata->has_llm_model_type();
+
+  // Select vision encoder and adapter signatures if max_vision_tokens_per_image
+  // is set by user, or fallback to metadata from proto if it exists.
+  std::optional<int> vision_token_limit;
+  if (engine_settings.GetVisionExecutorSettings().has_value()) {
+    if (engine_settings.GetMaxVisionTokensPerImage().has_value()) {
+      const int max_vision_tokens_per_image =
+          *engine_settings.GetMaxVisionTokensPerImage();
+      if (max_vision_tokens_per_image <= 0) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("max_vision_tokens_per_image must be positive, got: ",
+                         max_vision_tokens_per_image));
+      }
+      if (GetVisionTokensPerImageFromMetadata(llm_metadata).has_value()) {
+        vision_token_limit = max_vision_tokens_per_image;
+      }
+    } else {
+      vision_token_limit = GetVisionTokensPerImageFromMetadata(llm_metadata);
+      if (vision_token_limit.has_value() && *vision_token_limit > 0) {
+        engine_settings.SetMaxVisionTokensPerImage(*vision_token_limit);
+      }
+    }
+  }
+
+  if (vision_token_limit.has_value() && *vision_token_limit > 0) {
+    ABSL_ASSIGN_OR_RETURN(
+        auto vision_sig_info,
+        SelectVisionEncoderSignatures(*model_resources, *vision_token_limit));
+    engine_settings.GetMutableVisionExecutorSettings()
+        ->SetEncoderSelectedSignatures(vision_sig_info.signature_names);
+
+    ABSL_ASSIGN_OR_RETURN(
+        auto adapter_sig_info,
+        SelectVisionAdapterSignatures(*model_resources, *vision_token_limit));
+    if (adapter_sig_info.has_value()) {
+      engine_settings.GetMutableVisionExecutorSettings()
+          ->SetAdapterSelectedSignatures(adapter_sig_info->signature_names);
+    }
+  }
+  bool hasLlmModelType =
+      llm_metadata != nullptr && llm_metadata->has_llm_model_type();
   absl::Duration tokenizer_duration = absl::ZeroDuration();
   // This lambda is used to create the tokenizer asynchronously if the model
   // type is available, such that the tokenizer can be created in parallel with
@@ -209,10 +346,10 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       [&tokenizer_duration,
        &model_resources]() -> absl::StatusOr<std::unique_ptr<Tokenizer>> {
     absl::Time start_time = absl::Now();
-    ASSIGN_OR_RETURN(std::unique_ptr<Tokenizer> tokenizer,
-                     model_resources->GetTokenizer());
+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<Tokenizer> tokenizer,
+                          model_resources->GetTokenizer());
     tokenizer_duration = absl::Now() - start_time;
-    return tokenizer;
+    return std::move(tokenizer);
   };
 
   const auto& main_executor_settings =
@@ -221,12 +358,12 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   std::future<absl::StatusOr<std::unique_ptr<Tokenizer>>> tokenizer_future;
   std::unique_ptr<Tokenizer> tokenizer;
   if (!hasLlmModelType) {
-    ABSL_LOG(INFO)
+    ABSL_VLOG(1)
         << "Legacy model files don't have LlmModelType, loading tokenizer now";
-    ASSIGN_OR_RETURN(tokenizer, create_tokenizer());
+    ABSL_ASSIGN_OR_RETURN(tokenizer, create_tokenizer());
     // Update and load the parameters from the model file and convert the
     // tokens to ids.
-    RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
+    ABSL_RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
         tokenizer.get(), llm_metadata, input_prompt_as_hint,
         model_resources->GetTFLiteModelBackendConstraint(
             ModelType::kTfLitePrefillDecode),
@@ -243,8 +380,8 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   } else {
     // If the model type is available, wait for the tokenizer to be created
     // after the model is loaded.
-    ABSL_LOG(INFO) << "New model files have LlmModelType, loading tokenizer "
-                      "asynchronously";
+    ABSL_VLOG(1) << "New model files have LlmModelType, loading tokenizer "
+                    "asynchronously";
 
     if (engine_settings.GetParallelFileSectionLoading()) {
       // Launch the tokenizer creation in a separate thread in parallel with the
@@ -255,7 +392,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       tokenizer_future = std::async(std::launch::deferred, create_tokenizer);
     }
 
-    RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
+    ABSL_RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
         nullptr, llm_metadata, input_prompt_as_hint,
         model_resources->GetTFLiteModelBackendConstraint(
             ModelType::kTfLitePrefillDecode),
@@ -272,20 +409,49 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   }
 
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
+    ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseStart(
         BenchmarkInfo::InitPhase::kExecutor));
   }
 
-  ASSIGN_OR_RETURN(auto& litert_env,
-                   GetEnvironment(engine_settings, model_resources.get()));
+  std::unique_ptr<OwnedEnvironment> owned_env;
+  {
+    ABSL_ASSIGN_OR_RETURN(
+        auto temp_owned_env,
+        CreateEnvironment(engine_settings, model_resources.get()));
+    owned_env = std::make_unique<OwnedEnvironment>(std::move(temp_owned_env));
+  }
 
   std::unique_ptr<LlmExecutor> executor;
 
+  // Engine-scoped Debugger handle enabled via LITERT_LM_DEBUGGER_ENABLED=1.
+  // Defaults to nullptr for zero-overhead in standard production Release
+  // builds.
+  std::shared_ptr<RuntimeDebugger> runtime_debugger = nullptr;
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+  runtime_debugger =
+      RuntimeDebugger::Create(main_executor_settings.GetCacheDir());
+#endif  // defined(LITERT_LM_DEBUGGER_ENABLED)
+
   switch (main_executor_settings.GetBackend()) {
     default: {
-      ASSIGN_OR_RETURN(
-          executor, CreateLlmLiteRtCompiledModelExecutor(
-                        main_executor_settings, litert_env, *model_resources));
+      ABSL_ASSIGN_OR_RETURN(executor, CreateLlmLiteRtCompiledModelExecutor(
+                                          main_executor_settings,
+                                          owned_env->env, *model_resources));
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+      if (main_executor_settings.GetBackend() == Backend::CPU ||
+          main_executor_settings.GetBackend() == Backend::GPU) {
+        if (auto* litert_executor =
+                dynamic_cast<LlmLiteRtCompiledModelExecutorBase*>(
+                    executor.get())) {
+          if (runtime_debugger != nullptr) {
+            litert_executor->UpdatePreGraphRunCallback(
+                runtime_debugger->CreatePreGraphRunCallback());
+            litert_executor->UpdatePostGraphRunCallback(
+                runtime_debugger->CreatePostGraphRunCallback());
+          }
+        }
+      }
+#endif  // defined(LITERT_LM_DEBUGGER_ENABLED)
     }
   };
 
@@ -306,14 +472,14 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   }
 
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         benchmark_info->TimeInitPhaseEnd(BenchmarkInfo::InitPhase::kExecutor));
   }
 
   if (hasLlmModelType) {
     // Now load the tokenizer and update the engine settings.
-    ASSIGN_OR_RETURN(tokenizer, tokenizer_future.get());
-    RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
+    ABSL_ASSIGN_OR_RETURN(tokenizer, tokenizer_future.get());
+    ABSL_RETURN_IF_ERROR(engine_settings.MaybeUpdateAndValidate(
         tokenizer.get(), llm_metadata, input_prompt_as_hint,
         model_resources->GetTFLiteModelBackendConstraint(
             ModelType::kTfLitePrefillDecode),
@@ -329,39 +495,41 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
             ModelType::kTfLiteAudioEncoderHw)));
     // As we load the tokenizer asynchronously, we need to update the executor
     // settings after the tokenizer is loaded.
-    RETURN_IF_ERROR(executor->UpdateExecutorSettings(
+    ABSL_RETURN_IF_ERROR(executor->UpdateExecutorSettings(
         engine_settings.GetMainExecutorSettings()));
   }
 
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(benchmark_info->InitPhaseRecord(
+    ABSL_RETURN_IF_ERROR(benchmark_info->InitPhaseRecord(
         BenchmarkInfo::InitPhase::kTokenizer, tokenizer_duration));
   }
   std::unique_ptr<ExecutionManager> execution_manager;
   if (!engine_settings.GetSingleThreadedExecution()) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         execution_manager,
         ThreadedExecutionManager::Create(
             tokenizer.get(), model_resources.get(), std::move(executor),
             std::move(vision_executor_settings_ptr),
-            std::move(audio_executor_settings_ptr), &litert_env));
+            std::move(audio_executor_settings_ptr), &owned_env->env,
+            /*audio_executor=*/nullptr, runtime_debugger));
   } else {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         execution_manager,
         SerialExecutionManager::Create(
             tokenizer.get(), model_resources.get(), std::move(executor),
             std::move(vision_executor_settings_ptr),
-            std::move(audio_executor_settings_ptr), &litert_env));
+            std::move(audio_executor_settings_ptr), &owned_env->env,
+            /*audio_executor=*/nullptr, runtime_debugger));
   }
 
   if (benchmark_info.has_value()) {
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         benchmark_info->TimeInitPhaseEnd(BenchmarkInfo::InitPhase::kTotal));
   }
 
   auto llm_impl = std::make_unique<EngineAdvancedImpl>(
       std::move(engine_settings), std::move(model_resources),
-      std::move(tokenizer), std::move(execution_manager),
+      std::move(owned_env), std::move(tokenizer), std::move(execution_manager),
       std::move(benchmark_info));
 
   return llm_impl;

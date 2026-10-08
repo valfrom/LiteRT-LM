@@ -29,10 +29,16 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/sampler.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/framework/resource_management/context_handler/context_handler.h"
 
 namespace litert::lm {
@@ -99,6 +105,13 @@ class ExecutionManager {
   virtual absl::Status WaitUntilSessionDone(SessionId session_id,
                                             absl::Duration timeout) = 0;
 
+  // Updates whether to enable Metal residency set on GPU at runtime.
+  virtual absl::Status UpdateGpuEnableMetalResidencySet(
+      bool enable_metal_residency_set) {
+    return absl::UnimplementedError(
+        "UpdateGpuEnableMetalResidencySet not implemented.");
+  }
+
   // Waits until all tasks are done or the timeout is reached.
   // Returns:
   // - OK if all tasks are done.
@@ -161,28 +174,44 @@ class ExecutionManager {
   // - task_id: The task ID of the task.
   // - dep_tasks: The dependent tasks that should be done before the decode
   //   task starts.
+  // - repetition_penalty_config: The repetition penalty config for the decode
+  //   task.
+  // - no_repeat_ngram_config: The no repeat ngram config for the decode task.
+  // - suppress_tokens_config: The suppress tokens config for the decode task.
   // - constraint: The constraint for the decode task.
   // - cancelled: The cancelled flag for the decode task.
   // - callback: The callback function.
   virtual absl::Status AddDecodeTask(
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
+      RepetitionPenaltyConfig repetition_penalty_config,
+      NoRepeatNgramConfig no_repeat_ngram_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
-      int max_output_tokens) = 0;
+      int max_output_tokens,
+      std::optional<int> thinking_token_budget = std::nullopt,
+      std::vector<int> thinking_start_token_ids = {},
+      std::vector<int> thinking_end_token_ids = {}) = 0;
 
   // Adds a decode task to the execution manager with the maximum output tokens
   // set to infinity.
   absl::Status AddDecodeTask(
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
+      RepetitionPenaltyConfig repetition_penalty_config,
+      NoRepeatNgramConfig no_repeat_ngram_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
-    return AddDecodeTask(session_id, task_id, std::move(dep_tasks), constraint,
+    return AddDecodeTask(session_id, task_id, std::move(dep_tasks),
+                         std::move(repetition_penalty_config),
+                         std::move(no_repeat_ngram_config),
+                         std::move(suppress_tokens_config), constraint,
                          std::move(cancelled), std::move(callback),
-                         std::numeric_limits<int>::max());
+                         std::numeric_limits<int>::max(), std::nullopt, {}, {});
   }
 
   // Adds a clone session task to the execution manager.
@@ -236,6 +265,20 @@ class ExecutionManager {
   // Returns the audio executor properties.
   virtual absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const = 0;
+
+  // Synchronously encodes an audio spectrogram tensor into audio soft tokens
+  // within the context of the given session.
+  virtual absl::StatusOr<ExecutorAudioData> EncodeAudio(
+      const SessionInfo& session_info,
+      const TensorBuffer& spectrogram_tensor) = 0;
+
+  // Resets the audio executor for the given session.
+  virtual absl::Status ResetAudio(const SessionInfo& session_info) = 0;
+
+  // Flushes remaining buffered audio frames from the audio executor for the
+  // given session.
+  virtual absl::StatusOr<ExecutorAudioData> FlushAudio(
+      const SessionInfo& session_info) = 0;
 
   // Returns the vision executor properties.
   virtual absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()

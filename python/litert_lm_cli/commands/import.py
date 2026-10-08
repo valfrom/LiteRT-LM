@@ -14,12 +14,10 @@
 
 """Import subcommand for LiteRT-LM CLI."""
 
-import collections.abc
-import http.client
 import os
+import pathlib
 import shutil
 import ssl
-import tempfile
 import textwrap
 import urllib.error
 import urllib.parse
@@ -27,76 +25,11 @@ import urllib.request
 
 import click
 
+from litert_lm_cli import cli_helpers
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
+from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
-
-_DOWNLOAD_CHUNK_SIZE = 1024 * 64
-
-
-def _stream_download(
-    response: http.client.HTTPResponse,
-    *,
-    length: int | None,
-    format_progress: collections.abc.Callable[[int], str],
-) -> str:
-  """Streams the response body to a temporary file with a progress bar.
-
-  If any exception occurs during the download or file writing, the temporary
-  file is guaranteed to be cleaned up.
-
-  Args:
-    response: The HTTPResponse object to read the body from.
-    length: The total expected length of the download in bytes, if known. Used
-      for the progress bar's total size.
-    format_progress: A callable that takes the current progress position (in
-      bytes) and returns a formatted string for the progress bar.
-
-  Returns:
-    The absolute path to the temporary file where the response body was written.
-  """
-  # Use a dedicated download directory within the user's home to avoid potential
-  # space limitations or quota issues that might be present in /tmp.
-  download_dir = os.path.join(model.get_cli_base_dir(), "downloading")
-  os.makedirs(download_dir, exist_ok=True)
-  tmp_file = tempfile.NamedTemporaryFile(dir=download_dir, delete=False)
-  tmp_file_path = tmp_file.name
-
-  try:
-    with tmp_file:
-      with click.progressbar(
-          length=length,
-          show_pos=False,
-          show_percent=False,
-          show_eta=False,
-          item_show_func=lambda item: item,
-          bar_template="[%(bar)s]  %(info)s",
-          width=20,
-      ) as bar:
-        current_pos = 0
-        for chunk in iter(lambda: response.read(_DOWNLOAD_CHUNK_SIZE), b""):
-          tmp_file.write(chunk)
-          current_pos += len(chunk)
-          bar.update(len(chunk), current_item=format_progress(current_pos))
-    return tmp_file_path
-  except BaseException:
-    # Ensure the file is closed before attempting to remove it.
-    try:
-      os.remove(tmp_file_path)
-    except OSError:
-      pass
-    raise
-
-
-def _format_size(size_in_bytes: int) -> str:
-  """Formats bytes to a human-readable string (e.g., 18.2GB)."""
-  for unit in ["B", "KB", "MB", "GB", "TB"]:
-    if size_in_bytes < 1024.0:
-      if unit == "B":
-        return f"{int(size_in_bytes)}{unit}"
-      return f"{size_in_bytes:.1f}{unit}"
-    size_in_bytes /= 1024.0
-  return f"{size_in_bytes:.1f}PB"
 
 
 def download_experimental_model(
@@ -123,44 +56,59 @@ def download_experimental_model(
   req = urllib.request.Request(url, headers={"User-Agent": user_agent})
 
   try:
-    response = urllib.request.urlopen(req, context=ssl_context)
+    with urllib.request.urlopen(req, context=ssl_context) as response:
+      total_size = common.parse_total_size(response.getheader("Content-Length"))
+      size_suffix = common.download_size_suffix(total_size)
+
+      click.echo(f"Downloading {model_id!r}{size_suffix}...")
+
+      format_progress = lambda pos: common.format_download_progress(
+          pos, total_size
+      )
+      downloading_dir = pathlib.Path(model.get_cli_base_dir()) / "downloading"
+      return str(
+          common.stream_download(
+              response,
+              download_dir=downloading_dir,
+              length=total_size,
+              format_progress=format_progress,
+          )
+      )
+
   except urllib.error.URLError as e:
     raise click.ClickException(
-        f"Failed to download model '{model_id}': {e!r}"
+        f"Failed to download model {model_id!r}: {e!r}"
     ) from e
 
-  with response:
-    content_length = response.getheader("Content-Length")
-    if content_length is None:
-      total_size = None
-      size_suffix = ""
-    else:
-      try:
-        total_size = int(content_length)
-        size_suffix = f" ({_format_size(total_size)})"
-      except ValueError:
-        total_size = None
-        size_suffix = ""
 
-    click.echo(f"Downloading {model_id!r}{size_suffix}...")
+def _link_or_copy(source: str, dest: str) -> None:
+  """Links source to dest using a hard link, falling back to copy if needed.
 
-    def format_progress(current_pos_bytes: int) -> str:
-      if total_size and total_size > 0:
-        pct = int((current_pos_bytes / total_size) * 100)
-        return f"{pct}%"
+  Args:
+    source: The path to the source file.
+    dest: The path to the destination file.
 
-      if current_pos_bytes > 1024 * 1024:
-        return f"{current_pos_bytes / (1024 * 1024):.1f} MB"
-      return f"{current_pos_bytes / 1024:.1f} KB"
+  Raises:
+    FileNotFoundError: If the source file does not exist.
+  """
+  if not os.path.exists(source):
+    raise FileNotFoundError(f"Source file not found: {source}")
 
-    return _stream_download(
-        response,
-        length=total_size,
-        format_progress=format_progress,
-    )
+  if os.path.lexists(dest):
+    try:
+      if os.path.exists(dest) and os.path.samefile(source, dest):
+        return
+    except OSError:
+      pass
+    os.remove(dest)
+
+  try:
+    os.link(source, dest)
+  except OSError:
+    shutil.copy(source, dest)
 
 
-def _copy_source(
+def _link_source(
     source: str,
     dest: str,
     *,
@@ -168,17 +116,16 @@ def _copy_source(
     user_agent: str | None,
     ssl_context: ssl.SSLContext | None = None,
 ) -> str | None:
-  """Copies the source file to dest, falling back to download if needed.
+  """Links the source file to dest using hard link, falling back to download if needed.
 
   If the source is a local file (equal to model_file) and is not found, and a
   user_agent is provided, it attempts to download it as an experimental model
-  and
-  then copies it.
+  and then links it.
 
   Args:
     source: The resolved source path (might be HF downloaded file or local
       file).
-    dest: The destination path to copy to.
+    dest: The destination path to link to.
     model_file: The original model file argument (used for download ID).
     user_agent: The user agent for experimental model download.
     ssl_context: The SSL context to use for experimental download.
@@ -190,11 +137,10 @@ def _copy_source(
   Raises:
     click.ClickException: If the `source` file is not found and, if
       `user_agent` is provided, the attempt to download it as an experimental
-      model
-      also fails.
+      model also fails.
   """
   try:
-    shutil.copy(source, dest)
+    _link_or_copy(source, dest)
     return None
   except FileNotFoundError as e:
     if source == model_file and user_agent:
@@ -204,7 +150,7 @@ def _copy_source(
           ssl_context=ssl_context,
       )
       try:
-        shutil.copy(downloaded_file, dest)
+        _link_or_copy(downloaded_file, dest)
         return downloaded_file
       except BaseException:
         try:
@@ -213,6 +159,9 @@ def _copy_source(
           pass
         raise
     raise click.ClickException(f"Source file not found: {source}") from e
+
+
+_copy_source = _link_source  # For backward compatibility
 
 
 @click.command(
@@ -239,14 +188,14 @@ def _copy_source(
     default=None,
     help="""The user agent used to download experimental models.""",
 )
-@click.argument("model_file")
-@click.argument("model_ref", required=False)
+@click.argument("model_file", required=False)
+@click.argument("import_as_model_id", required=False)
 def import_model(
     from_huggingface_repo: str | None,
     huggingface_token: str | None,
     user_agent: str | None,
-    model_file: str,
-    model_ref: str | None,
+    model_file: str | None,
+    import_as_model_id: str | None,
 ) -> None:
   """Imports a model from a local path or HuggingFace hub.
 
@@ -256,26 +205,31 @@ def import_model(
     user_agent: The user agent used to download experimental models (internal).
     model_file: The path in the repo (if from-huggingface-repo is set) or local
       path.
-    model_ref: The reference ID to store the model as. Defaults to the filename
-      of MODEL_FILE.
+    import_as_model_id: The model ID to store the model as. Defaults to the
+      filename of MODEL_FILE.
   """
-  effective_model_ref = model_ref or os.path.basename(model_file)
   temporary_file = None
 
-  if from_huggingface_repo:
-    downloaded_file = common.download_from_huggingface(
-        from_huggingface_repo, model_file, huggingface_token
-    )
-    if not downloaded_file:
-      raise click.ClickException(
-          f"Failed to download model file '{model_file}' from HuggingFace"
-          f" repository '{from_huggingface_repo}'."
-      )
-    source = downloaded_file
-  else:
-    source = model_file
+  if not model_file and not from_huggingface_repo:
+    raise click.UsageError("Missing argument 'MODEL_FILE'.")
 
-  model_obj = model.Model.from_model_id(effective_model_ref)
+  resolved_file = model_file or cli_helpers.resolve_model_file(
+      from_huggingface_repo,
+      huggingface_token,
+  )
+
+  if from_huggingface_repo:
+    source = huggingface_download.download_from_huggingface(
+        repo_id=from_huggingface_repo,
+        filename=resolved_file,
+        token=huggingface_token,
+    )
+  else:
+    source = resolved_file
+
+  effective_model_id = import_as_model_id or os.path.basename(resolved_file)
+
+  model_obj = model.Model.from_model_id(effective_model_id)
   model_path = model_obj.model_path
   model_dir = os.path.dirname(model_path)
 
@@ -284,10 +238,10 @@ def import_model(
   ssl_context = None
 
   try:
-    temporary_file = _copy_source(
+    temporary_file = _link_source(
         source,
         model_path,
-        model_file=model_file,
+        model_file=resolved_file,
         user_agent=user_agent,
         ssl_context=ssl_context,
     )
@@ -297,7 +251,7 @@ def import_model(
     click.echo(
         click.style(
             "You can now run the model with 'litert-lm run"
-            f" {effective_model_ref}'",
+            f" {effective_model_id}'",
             fg="green",
         )
     )

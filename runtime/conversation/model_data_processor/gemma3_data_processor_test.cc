@@ -15,12 +15,8 @@
 #include "runtime/conversation/model_data_processor/gemma3_data_processor.h"
 
 #include <filesystem>  // NOLINT: Required for path manipulation.
-#include <fstream>
-#include <ios>
-#include <iterator>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -29,23 +25,20 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
-#include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "litert/cc/litert_layout.h"  // from @litert
-#include "runtime/components/preprocessor/audio_preprocessor.h"
-#include "runtime/components/preprocessor/audio_preprocessor_miniaudio.h"
-#include "runtime/components/preprocessor/image_preprocessor.h"
-#include "runtime/components/preprocessor/stb_image_preprocessor.h"
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/gemma3_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/model_data_processor.h"
+#include "runtime/conversation/model_data_processor/test_utils.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // NOLINT
+#include "support/preprocessor/audio_preprocessor_miniaudio.h"
+#include "support/preprocessor/image_preprocessor.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
@@ -54,101 +47,23 @@ using json = nlohmann::ordered_json;
 using ::testing::ElementsAre;
 using ::testing::status::IsOkAndHolds;
 
-constexpr char kTestdataDir[] =
-    "litert_lm/runtime/components/testdata/";
-
-constexpr char kImageTestdataDir[] =
-    "litert_lm/runtime/components/preprocessor/testdata/";
-
-std::string GetTestdataPath(const std::string& file_name) {
-  return (std::filesystem::path(::testing::SrcDir()) / kTestdataDir / file_name)
-      .string();
-}
-
-std::string ReadFile(absl::string_view path) {
-  std::ifstream ifstr(std::string(path), std::ios::binary);
-  std::stringstream contents;
-  contents << ifstr.rdbuf();
-  return contents.str();
-}
-
-absl::StatusOr<std::string> GetContents(const std::string& path) {
-  std::ifstream input_stream(path);
-  if (!input_stream.is_open()) {
-    return absl::InternalError(absl::StrCat("Could not open file: ", path));
+class FakeNonSentencePieceTokenizer : public ::litert::support::Tokenizer {
+ public:
+  ::litert::support::TokenizerType GetTokenizerType() const override {
+    return ::litert::support::TokenizerType::kHuggingFace;
   }
-
-  std::string content;
-  content.assign((std::istreambuf_iterator<char>(input_stream)),
-                 (std::istreambuf_iterator<char>()));
-  return std::move(content);
-}
-
-MATCHER_P(HasInputText, text_input, "") {
-  if (!std::holds_alternative<InputText>(arg)) {
-    return false;
+  absl::StatusOr<std::vector<int>> TextToTokenIds(
+      absl::string_view text) override {
+    return std::vector<int>{};
   }
-  auto text_bytes = std::get<InputText>(arg).GetRawTextString();
-  if (!text_bytes.ok()) {
-    return false;
+  absl::StatusOr<int> TokenToId(absl::string_view token) override { return 0; }
+  absl::StatusOr<std::string> TokenIdsToText(
+      absl::Span<const int> token_ids, bool skip_special_tokens) override {
+    return "";
   }
-  return text_bytes.value() == text_input->GetRawTextString().value();
-}
-
-MATCHER_P(HasInputImage, image_input, "") {
-  if (!std::holds_alternative<InputImage>(arg)) {
-    return false;
-  }
-  if (std::get<InputImage>(arg).GetRawImageBytes().ok()) {
-    auto image_bytes = std::get<InputImage>(arg).GetRawImageBytes();
-    return image_bytes.value() == image_input->GetRawImageBytes().value();
-  }
-  if (std::get<InputImage>(arg).GetPreprocessedImageTensor().ok()) {
-    auto buffer_span = ReferTensorBufferAsSpan<float>(
-        *std::get<InputImage>(arg).GetPreprocessedImageTensor().value());
-    if (!buffer_span.HasValue()) {
-      return false;
-    }
-    auto expected_buffer_span = ReferTensorBufferAsSpan<float>(
-        *image_input->GetPreprocessedImageTensor().value());
-    if (!expected_buffer_span.HasValue()) {
-      return false;
-    }
-    return *buffer_span == *expected_buffer_span;
-  }
-  return true;
-}
-
-MATCHER_P(HasInputAudio, audio_input, "") {
-  if (!std::holds_alternative<InputAudio>(arg)) {
-    return false;
-  }
-  if (std::get<InputAudio>(arg).GetRawAudioBytes().ok()) {
-    auto audio_bytes = std::get<InputAudio>(arg).GetRawAudioBytes();
-    return audio_bytes.value() == audio_input->GetRawAudioBytes().value();
-  }
-  if (std::get<InputAudio>(arg).GetPreprocessedAudioTensor().ok()) {
-    auto buffer_span = ReferTensorBufferAsSpan<float>(
-        *std::get<InputAudio>(arg).GetPreprocessedAudioTensor().value());
-    if (!buffer_span.HasValue()) {
-      return false;
-    }
-    auto expected_buffer_span = ReferTensorBufferAsSpan<float>(
-        *audio_input->GetPreprocessedAudioTensor().value());
-    if (!expected_buffer_span.HasValue()) {
-      return false;
-    }
-    return *buffer_span == *expected_buffer_span;
-  }
-  return true;
-}
-
-MATCHER(HasInputAudioEnd, "") {
-  if (!std::holds_alternative<InputAudioEnd>(arg)) {
-    return false;
-  }
-  return true;
-}
+  std::vector<std::string> GetTokens() const override { return {}; }
+  int GetVocabSize() const override { return 0; }
+};
 
 class Gemma3DataProcessorTest : public ::testing::Test {
  protected:
@@ -161,6 +76,10 @@ class Gemma3DataProcessorTest : public ::testing::Test {
 
   std::unique_ptr<Tokenizer> tokenizer_;
 };
+
+class Gemma3DataProcessorImageTest
+    : public Gemma3DataProcessorTest,
+      public ::testing::WithParamInterface<std::string> {};
 
 TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextOnly) {
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create());
@@ -178,7 +97,8 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextOnly) {
   EXPECT_THAT(input_data, ElementsAre(HasInputText(&expected_text)));
 }
 
-TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndImage) {
+TEST_P(Gemma3DataProcessorImageTest, ToInputDataVectorTextAndImage) {
+  std::string image_name = GetParam();
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create(
                                            /*Gemma3DataProcessorConfig=*/
                                            {.image_tensor_height = 224,
@@ -187,9 +107,7 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndImage) {
       "<start_of_turn>user\nHere is an image of apples "
       "<start_of_image><end_of_turn>";
 
-  std::string image_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kImageTestdataDir / "apple.png")
-                               .string();
+  std::string image_path = GetImageTestdataPath(image_name);
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -203,11 +121,11 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndImage) {
   InputText expected_text1(
       "<start_of_turn>user\nHere is an image of apples "
       "\n\n<start_of_image>");
-  StbImagePreprocessor image_preprocessor;
+  auto image_preprocessor = ImagePreprocessor::Create();
   ImagePreprocessParameter image_params;
   image_params.SetTargetDimensions(Dimensions({1, 224, 128, 3}));
   ASSERT_OK_AND_ASSIGN(InputImage expected_image,
-                       image_preprocessor.Preprocess(
+                       image_preprocessor->Preprocess(
                            InputImage(ReadFile(image_path)), image_params));
   InputText expected_text2("\n\n");
   InputText expected_text3("<end_of_turn>");
@@ -447,16 +365,16 @@ What is the capital of France?<end_of_turn>
   EXPECT_THAT(input_data, ElementsAre(HasInputText(&expected_text)));
 }
 
-TEST_F(Gemma3DataProcessorTest, PromptTemplateToInputDataVectorTextAndImage) {
+TEST_P(Gemma3DataProcessorImageTest,
+       PromptTemplateToInputDataVectorTextAndImage) {
+  std::string image_name = GetParam();
   const std::string test_file_path =
       GetTestdataPath("google-gemma-3-1b-it.jinja");
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
 
-  std::string image_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kImageTestdataDir / "apple.png")
-                               .string();
+  std::string image_path = GetImageTestdataPath(image_name);
   const nlohmann::ordered_json messages = {
       {{"role", "system"}, {"content", "Hello world!"}},
       {{"role", "user"},
@@ -485,11 +403,11 @@ Hello world!
 How are you?
 
 <start_of_image>)""");
-  StbImagePreprocessor image_preprocessor;
+  auto image_preprocessor = ImagePreprocessor::Create();
   ImagePreprocessParameter image_params;
   image_params.SetTargetDimensions(Dimensions({1, 768, 768, 3}));
   ASSERT_OK_AND_ASSIGN(InputImage expected_image,
-                       image_preprocessor.Preprocess(
+                       image_preprocessor->Preprocess(
                            InputImage(ReadFile(image_path)), image_params));
   InputText expected_text2("\n\n");
   InputText expected_text3(R"""(<end_of_turn>
@@ -602,10 +520,11 @@ TEST_F(Gemma3DataProcessorTest, MessageToTemplateInputWithStringContent) {
       {"content", "test prompt"},
   };
 
-  // The template input is identical to the original message if the content is
-  // a string.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(message));
+              IsOkAndHolds(nlohmann::ordered_json({
+                  {"role", "user"},
+                  {"content", {{{"type", "text"}, {"text", "test prompt"}}}},
+              })));
 }
 
 TEST_F(Gemma3DataProcessorTest, MessageToTemplateInputWithTextContent) {
@@ -835,11 +754,17 @@ TEST_F(Gemma3DataProcessorTest,
   })json");
 
   // The "tool_response" in "content", which is an object rather than an array,
-  // is converted into a string representation of a Python dict.
+  // is converted into a string representation of a Python dict wrapped in an
+  // array of multimodal text parts.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key1\": \"value1\", \"key2\": \"value2\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key1\": \"value1\", \"key2\": \"value2\"}"
+                  }
+                ]
               })json")));
 }
 
@@ -848,7 +773,7 @@ TEST_F(Gemma3DataProcessorTest,
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create());
 
   // Case 1: tool_response key
-  const nlohmann::ordered_json message1 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message1 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "tool_response": {
@@ -859,11 +784,16 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message1),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key1\": \"value1\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key1\": \"value1\"}"
+                  }
+                ]
               })json")));
 
   // Case 2: response key
-  const nlohmann::ordered_json message2 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message2 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "response": {
@@ -874,11 +804,16 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message2),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key2\": \"value2\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key2\": \"value2\"}"
+                  }
+                ]
               })json")));
 
   // Case 3: Top-level fields
-  const nlohmann::ordered_json message3 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message3 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "key3": "value3"
@@ -887,7 +822,12 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message3),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key3\": \"value3\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key3\": \"value3\"}"
+                  }
+                ]
               })json")));
 }
 
@@ -1001,9 +941,7 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndAudio) {
       "<start_of_turn>user\nHere is an audio. Please transcribe it: "
       "<start_of_audio><end_of_turn>";
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -1040,9 +978,7 @@ TEST_F(Gemma3DataProcessorTest, PromptTemplateToInputDataVectorTextAndAudio) {
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json messages = {
       {{"role", "system"}, {"content", "Hello world!"}},
       {{"role", "user"},
@@ -1185,6 +1121,34 @@ TEST_F(Gemma3DataProcessorTest, CreateConstraintAlternativeToolFormat) {
   ASSERT_OK_AND_ASSIGN(auto constraint, processor->CreateConstraint(tools));
 }
 
+TEST_F(Gemma3DataProcessorTest, CreateConstraintWithNonSentencePieceTokenizer) {
+  FakeNonSentencePieceTokenizer fake_tokenizer;
+  ASSERT_OK_AND_ASSIGN(
+      auto processor,
+      Gemma3DataProcessor::Create(Gemma3DataProcessorConfig(),
+                                  /*preface=*/std::nullopt, &fake_tokenizer,
+                                  /*stop_token_ids=*/{},
+                                  /*enable_constrained_decoding=*/true));
+  const nlohmann::ordered_json tools = nlohmann::ordered_json::parse(R"json([
+    {
+      "name": "get_weather",
+      "description": "Gets weather information.",
+      "parameters": {
+        "properties": {
+          "location": {
+            "type": "STRING",
+            "description": "Weather location."
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  ])json");
+
+  ASSERT_OK_AND_ASSIGN(auto constraint, processor->CreateConstraint(tools));
+  EXPECT_EQ(constraint, nullptr);
+}
+
 TEST_F(Gemma3DataProcessorTest, CloneState) {
   ASSERT_OK_AND_ASSIGN(auto processor1, Gemma3DataProcessor::Create());
   ASSERT_OK_AND_ASSIGN(auto processor2, Gemma3DataProcessor::Create());
@@ -1217,9 +1181,7 @@ TEST_F(Gemma3DataProcessorTest, CloneStateWithAudio) {
       "<start_of_turn>user\nHere is an audio. Please transcribe it: "
       "<start_of_audio><end_of_turn>";
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -1251,4 +1213,9 @@ TEST_F(Gemma3DataProcessorTest, CloneStateWithAudio) {
 #endif
 
 }  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Gemma3DataProcessorImageTests,
+                         Gemma3DataProcessorImageTest,
+                         ::testing::Values("apple.bmp", "apple.png"));
+
 }  // namespace litert::lm

@@ -128,6 +128,26 @@ alias(
 )
 
 tf_proto_library(
+    name = "executor_metadata",
+    srcs = ["executor_metadata.proto"],
+)
+
+alias(
+    name = "executor_metadata_proto",
+    actual = ":executor_metadata",
+)
+
+alias(
+    name = "executor_metadata_cc_proto",
+    actual = ":executor_metadata_cc",
+)
+
+alias(
+    name = "executor_metadata_py_pb2",
+    actual = ":executor_metadata_py_proto",
+)
+
+tf_proto_library(
     name = "litert_lm_metrics",
     srcs = ["litert_lm_metrics.proto"],
     deps = [":engine_proto"],
@@ -146,4 +166,131 @@ alias(
 alias(
     name = "litert_lm_metrics_py_pb2",
     actual = ":litert_lm_metrics_py_proto",
+)
+
+tf_proto_library(
+    name = "embedding_model_type",
+    srcs = ["embedding_model_type.proto"],
+    deps = [":token"],
+)
+
+alias(
+    name = "embedding_model_type_proto",
+    actual = ":embedding_model_type",
+)
+
+alias(
+    name = "embedding_model_type_cc_proto",
+    actual = ":embedding_model_type_cc",
+)
+
+alias(
+    name = "embedding_model_type_py_pb2",
+    actual = ":embedding_model_type_py_proto",
+)
+
+tf_proto_library(
+    name = "embedding_metadata",
+    srcs = ["embedding_metadata.proto"],
+    deps = [
+        ":embedding_model_type",
+        ":token",
+    ],
+)
+
+alias(
+    name = "embedding_metadata_proto",
+    actual = ":embedding_metadata",
+)
+
+alias(
+    name = "embedding_metadata_cc_proto",
+    actual = ":embedding_metadata_cc",
+)
+
+alias(
+    name = "embedding_metadata_py_pb2",
+    actual = ":embedding_metadata_py_proto",
+)
+
+tf_proto_library(
+    name = "tts_model_type",
+    srcs = ["tts_model_type.proto"],
+)
+
+alias(
+    name = "tts_model_type_proto",
+    actual = ":tts_model_type",
+)
+
+alias(
+    name = "tts_model_type_cc_proto",
+    actual = ":tts_model_type_cc",
+)
+
+alias(
+    name = "tts_model_type_py_pb2",
+    actual = ":tts_model_type_py_proto",
+)
+
+tf_proto_library(
+    name = "tts_metadata",
+    srcs = ["tts_metadata.proto"],
+    deps = [":tts_model_type"],
+)
+
+alias(
+    name = "tts_metadata_proto",
+    actual = ":tts_metadata",
+)
+
+alias(
+    name = "tts_metadata_cc_proto",
+    actual = ":tts_metadata_cc",
+)
+
+alias(
+    name = "tts_metadata_py_pb2",
+    actual = ":tts_metadata_py_proto",
+)
+
+tf_proto_library(
+    name = "asr_model_type",
+    srcs = ["asr_model_type.proto"],
+)
+
+alias(
+    name = "asr_model_type_proto",
+    actual = ":asr_model_type",
+)
+
+alias(
+    name = "asr_model_type_cc_proto",
+    actual = ":asr_model_type_cc",
+)
+
+alias(
+    name = "asr_model_type_py_pb2",
+    actual = ":asr_model_type_py_proto",
+)
+
+tf_proto_library(
+    name = "asr_metadata",
+    srcs = ["asr_metadata.proto"],
+    deps = [":asr_model_type"],
+)
+
+alias(
+    name = "asr_metadata_proto",
+    actual = ":asr_metadata",
+)
+
+alias(
+    name = "asr_metadata_cc_proto",
+    actual = ":asr_metadata_cc",
+)
+
+alias(
+    name = "asr_metadata_py_pb2",
+    actual = ":asr_metadata_py_proto",
 )

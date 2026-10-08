@@ -1,0 +1,506 @@
+# Copyright 2026 The ODML Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for model info extraction API."""
+
+import pathlib
+from unittest import mock
+
+from absl import flags
+from absl.testing import absltest
+
+import litert_lm
+
+FLAGS = flags.FLAGS
+
+
+class ModelInfoTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_path = (
+        pathlib.Path(FLAGS.test_srcdir)
+        / "litert_lm/runtime/testdata/test_lm.litertlm"
+    )
+
+  def test_model_info_load(self):
+    model_info = litert_lm.ModelInfo(self.model_path)
+
+    # Check simple capability flags (expect False for the legacy test model)
+    self.assertIsNotNone(model_info.llm)
+    assert model_info.llm is not None
+    self.assertIsNone(model_info.embedding)
+    self.assertFalse(model_info.llm.supports_thinking())
+    self.assertFalse(model_info.llm.supports_function_calling())
+    self.assertFalse(model_info.llm.has_speculative_decoding_support())
+    self.assertEqual(model_info.model_type, litert_lm.ModelType.LLM)
+    self.assertFalse(model_info.is_embedding_model)
+    self.assertTrue(model_info.is_llm_model)
+    self.assertEqual(model_info.max_vision_token_budget, -1)
+    self.assertIsNone(model_info.vision_signature_selection)
+    self.assertIsNone(model_info.min_runtime_version)
+    self.assertEqual(model_info.max_context_tokens, 128)
+    self.assertFalse(model_info.is_dynamic_context)
+    self.assertFalse(model_info.llm.is_dynamic_context)
+
+    # Verify modality-specific backends for text (defaults to CPU and GPU)
+    self.assertEqual(
+        model_info.supported_backends_for_modality(
+            litert_lm.LiteRtLmModality.TEXT
+        ),
+        ["cpu", "gpu"],
+    )
+    # Verify modality-specific backends for vision (not present -> empty)
+    self.assertEqual(
+        model_info.supported_backends_for_modality(
+            litert_lm.LiteRtLmModality.VISION
+        ),
+        [],
+    )
+    self.assertEqual(
+        model_info.npu_brand_for_modality(litert_lm.LiteRtLmModality.TEXT),
+        litert_lm.LiteRtLmNpuBrand.UNKNOWN,
+    )
+    self.assertIsNone(
+        model_info.soc_name_for_modality(litert_lm.LiteRtLmModality.TEXT)
+    )
+
+    # Modalities
+    self.assertTrue(model_info.input_modalities.text)
+    self.assertFalse(model_info.input_modalities.vision)
+    self.assertFalse(model_info.input_modalities.audio)
+    self.assertFalse(model_info.input_modalities.video)
+
+    # Sampler default parameters (from test model config)
+    sampler_config = model_info.llm.default_sampler_params
+    self.assertIsInstance(sampler_config, litert_lm.SamplerConfig)
+    self.assertEqual(sampler_config.temperature, 0.0)
+    self.assertEqual(sampler_config.top_k, 1)
+    top_p = sampler_config.top_p
+    self.assertIsNotNone(top_p)
+    self.assertAlmostEqual(top_p, 0.7)
+
+  def test_model_info_non_existent_file(self):
+    with self.assertRaises(FileNotFoundError):
+      litert_lm.ModelInfo("/non/existent/path")
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_model_info_destructor_deletes_handle(
+      self, mock_exists, mock_get_lib
+  ):
+    del mock_exists  # Unused.
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(model_info._handle, 12345)
+
+    model_info.__del__()
+    mock_lib.litert_lm_loaded_file_delete.assert_called_once_with(12345)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_model_info_creation_failure_raises_runtime_error(
+      self, mock_exists, mock_get_lib
+  ):
+    del mock_exists
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 0
+
+    with self.assertRaises(RuntimeError):
+      litert_lm.ModelInfo("/invalid/model.litertlm")
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_model_info_destructor_noop_when_handle_none(
+      self, mock_exists, mock_get_lib
+  ):
+    del mock_exists
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    model_info._handle = None  # Clear handle manually
+    model_info.__del__()
+    mock_lib.litert_lm_loaded_file_delete.assert_not_called()
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_model_info_destructor_noop_when_handle_not_set(
+      self, mock_exists, mock_get_lib
+  ):
+    del mock_exists
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+
+    # Create uninitialized model_info object
+    model_info = object.__new__(litert_lm.ModelInfo)
+    try:
+      model_info.__del__()
+    except AttributeError as e:
+      self.fail(f"__del__ raised AttributeError on uninitialized object: {e}")
+
+  def test_model_info_context_manager(self):
+    with litert_lm.ModelInfo(self.model_path) as model_info:
+      self.assertIsNotNone(model_info.llm)
+      assert model_info.llm is not None
+      self.assertFalse(model_info.llm.supports_thinking())
+      llm = model_info.llm
+    # Outside context block, model_info should be closed
+    with self.assertRaises(RuntimeError):
+      _ = llm.supports_thinking()
+
+  def test_model_info_close_explicit(self):
+    model_info = litert_lm.ModelInfo(self.model_path)
+    llm = model_info.llm
+    self.assertIsNotNone(llm)
+    assert llm is not None
+    model_info.close()
+    with self.assertRaises(RuntimeError):
+      _ = llm.supports_thinking()
+    with self.assertRaises(RuntimeError):
+      _ = llm.default_sampler_params
+    with self.assertRaises(RuntimeError):
+      _ = model_info.input_modalities
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_max_vision_token_budget(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_max_vision_token_budget.return_value = 280
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(model_info.max_vision_token_budget, 280)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_vision_signature_selection(
+      self, unused_mock_exists, mock_get_lib
+  ):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+
+    def side_effect(unused_handle, lengths, unused_max_size):
+      if lengths is None:
+        return 2
+      lengths[0] = 64
+      lengths[1] = 256
+      return 2
+
+    mock_lib.litert_lm_loaded_file_vision_signature_selection.side_effect = (
+        side_effect
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(model_info.vision_signature_selection, [64, 256])
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_min_runtime_version(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_min_runtime_version.return_value = b"0.12.3"
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(model_info.min_runtime_version, "0.12.3")
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_min_runtime_version_not_set(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_min_runtime_version.return_value = None
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNone(model_info.min_runtime_version)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_supported_backends_for_modality(
+      self, unused_mock_exists, mock_get_lib
+  ):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+
+    def fake_supported_backends(
+        unused_handle, unused_modality, out_arr, unused_max_size
+    ):
+      if out_arr is None:
+        return 2
+      out_arr[0] = int(litert_lm.LiteRtLmBackendType.GPU)
+      out_arr[1] = int(litert_lm.LiteRtLmBackendType.CPU)
+      return 2
+
+    mock_lib.litert_lm_loaded_file_modality_supported_backends.side_effect = (
+        fake_supported_backends
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(
+        model_info.supported_backends_for_modality(
+            litert_lm.LiteRtLmModality.VISION
+        ),
+        ["gpu", "cpu"],
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_npu_brand_for_modality(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_modality_npu_brand.return_value = int(
+        litert_lm.LiteRtLmNpuBrand.MEDIATEK
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(
+        model_info.npu_brand_for_modality(litert_lm.LiteRtLmModality.AUDIO),
+        litert_lm.LiteRtLmNpuBrand.MEDIATEK,
+    )
+    assert_brand = mock_lib.litert_lm_loaded_file_modality_npu_brand
+    assert_brand.assert_called_once_with(
+        12345, int(litert_lm.LiteRtLmModality.AUDIO)
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_soc_name_for_modality(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_modality_soc_name.return_value = b"SM8750"
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(
+        model_info.soc_name_for_modality(litert_lm.LiteRtLmModality.TEXT),
+        "SM8750",
+    )
+    assert_fn = mock_lib.litert_lm_loaded_file_modality_soc_name
+    assert_fn.assert_called_once_with(
+        12345, int(litert_lm.LiteRtLmModality.TEXT)
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_soc_name_for_modality_none(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_modality_soc_name.return_value = None
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNone(
+        model_info.soc_name_for_modality(litert_lm.LiteRtLmModality.TEXT)
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_max_context_tokens(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_max_context_tokens.return_value = 4096
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(model_info.max_context_tokens, 4096)
+    mock_lib.litert_lm_loaded_file_max_context_tokens.assert_called_once_with(
+        12345
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_is_dynamic_context(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_is_dynamic_context.return_value = True
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertTrue(model_info.is_dynamic_context)
+    mock_lib.litert_lm_loaded_file_is_dynamic_context.assert_called_once_with(
+        12345
+    )
+
+  def test_model_info_load_embedding_model(self):
+    embedding_model_path = (
+        pathlib.Path(FLAGS.test_srcdir)
+        / "litert_lm/runtime/testdata/test_embedding.litertlm"
+    )
+    model_info = litert_lm.ModelInfo(embedding_model_path)
+
+    self.assertEqual(model_info.model_type, litert_lm.ModelType.EMBEDDING)
+    self.assertTrue(model_info.is_embedding_model)
+    self.assertFalse(model_info.is_llm_model)
+    self.assertIsNone(model_info.llm)
+    self.assertIsNotNone(model_info.embedding)
+    assert model_info.embedding is not None
+    self.assertEqual(model_info.embedding.dimension, 768)
+    self.assertEqual(model_info.embedding.signature_selection, [128])
+    self.assertEqual(model_info.max_context_tokens, 128)
+    self.assertFalse(model_info.is_dynamic_context)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_is_embedding_and_llm_model(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_model_type.return_value = int(
+        litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertEqual(
+        model_info.model_type, litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+    self.assertTrue(model_info.is_embedding_model)
+    self.assertFalse(model_info.is_llm_model)
+    self.assertIsNotNone(model_info.embedding)
+    self.assertIsNone(model_info.llm)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_embedding_dimension(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_model_type.return_value = int(
+        litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+    mock_lib.litert_lm_loaded_file_embedding_dimension.return_value = 768
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNotNone(model_info.embedding)
+    assert model_info.embedding is not None
+    self.assertEqual(model_info.embedding.dimension, 768)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_embedding_dimension_unset(self, unused_mock_exists, mock_get_lib):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_model_type.return_value = int(
+        litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+    mock_lib.litert_lm_loaded_file_embedding_dimension.return_value = -1
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNotNone(model_info.embedding)
+    assert model_info.embedding is not None
+    self.assertIsNone(model_info.embedding.dimension)
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_embedding_signature_selection(
+      self, unused_mock_exists, mock_get_lib
+  ):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_model_type.return_value = int(
+        litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+
+    def side_effect(unused_handle, lengths, unused_max_size):
+      if lengths is None:
+        return 3
+      lengths[0] = 128
+      lengths[1] = 256
+      lengths[2] = 512
+      return 3
+
+    mock_lib.litert_lm_loaded_file_embedding_signature_selection.side_effect = (
+        side_effect
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNotNone(model_info.embedding)
+    assert model_info.embedding is not None
+    self.assertEqual(
+        model_info.embedding.signature_selection, [128, 256, 512]
+    )
+
+  @mock.patch(
+      "litert_lm.model_info._ffi._get_lib"
+  )
+  @mock.patch("os.path.exists", return_value=True)
+  def test_embedding_signature_selection_unset(
+      self, unused_mock_exists, mock_get_lib
+  ):
+    mock_lib = mock.MagicMock()
+    mock_get_lib.return_value = mock_lib
+    mock_lib.litert_lm_loaded_file_create.return_value = 12345
+    mock_lib.litert_lm_loaded_file_model_type.return_value = int(
+        litert_lm.LiteRtLmModelType.EMBEDDING
+    )
+    mock_lib.litert_lm_loaded_file_embedding_signature_selection.return_value = (
+        -1
+    )
+
+    model_info = litert_lm.ModelInfo("/fake/path")
+    self.assertIsNotNone(model_info.embedding)
+    assert model_info.embedding is not None
+    self.assertIsNone(model_info.embedding.signature_selection)
+
+
+if __name__ == "__main__":
+  absltest.main()
+

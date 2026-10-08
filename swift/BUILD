@@ -20,7 +20,6 @@ load("@build_bazel_rules_apple//apple:macos.bzl", "macos_dylib")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_interop_hint")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
-
 package(default_visibility = ["//visibility:public"])
 
 # Swift API for LiteRT LM.
@@ -28,25 +27,34 @@ swift_library(
     name = "LiteRT_LM_Swift",
     srcs = [
         "Benchmark.swift",
-        "Capabilities.swift",
         "Config.swift",
         "Conversation.swift",
+        "EmbeddingEngine.swift",
+        "EmbeddingEngineConfig.swift",
         "Engine.swift",
         "EvalPause.swift",
         "ExperimentalFlags.swift",
         "LiteRTLMError.swift",
         "Message.swift",
+        "ModelInfo.swift",
+        "ResponseFormat.swift",
         "Tool.swift",
         "ToolManager.swift",
     ],
     copts = ["-enable-testing"],
+    features = ["-swift.enable_v6"],
     module_name = "LiteRTLM",
     deps = [
-        ":CLiteRTLM_objc",
 
 
+        "@litert//litert/cc/options:litert_cpu_options",
+        "@litert//litert/cc/options:litert_google_tensor_options",
+        "@litert//litert/cc/options:litert_gpu_options",
+        "@litert//litert/cc/options:litert_intel_openvino_options",
+        "@litert//litert/cc/options:litert_mediatek_options",
+        "@litert//litert/cc/options:litert_qualcomm_options",
+        "@litert//litert/cc/options:litert_samsung_options",
         "//c:engine",
-        "//schema/capabilities:capabilities_c",
     ],
 )
 
@@ -57,6 +65,7 @@ swift_library(
     srcs = ["EngineTests.swift"],
     copts = ["-enable-testing"],
     data = ["//runtime/testdata"],
+    features = ["-swift.enable_v6"],
     deps = [
         ":LiteRT_LM_Swift",
 
@@ -70,6 +79,7 @@ swift_library(
     srcs = ["ConversationTests.swift"],
     copts = ["-enable-testing"],
     data = ["//runtime/testdata"],
+    features = ["-swift.enable_v6"],
     deps = [
         ":LiteRT_LM_Swift",
 
@@ -101,6 +111,16 @@ swift_library(
     ],
 )
 
+C_LITERT_LM_PUBLIC_HDRS = [
+    "//c:api_export.h",
+    "//c:conversation.h",
+    "//c:embedding_engine.h",
+    "//c:engine.h",
+    "//c:error_reporter.h",
+    "//c:experimental.h",
+    "//c:model_info.h",
+]
+
 swift_interop_hint(
     name = "CLiteRTLM_swift_hint",
     module_name = "CLiteRTLM",
@@ -108,14 +128,10 @@ swift_interop_hint(
 
 cc_library(
     name = "CLiteRTLM_objc",
-    hdrs = [
-        "//c:engine.h",
-        "//schema/capabilities:capabilities_c.h",
-    ],
+    hdrs = C_LITERT_LM_PUBLIC_HDRS,
     aspect_hints = [":CLiteRTLM_swift_hint"],
     deps = [
         "//c:engine",
-        "//schema/capabilities:capabilities_c",
     ],
 )
 
@@ -135,10 +151,7 @@ apple_xcframework(
     minimum_os_versions = {
         "ios": "16.0",
     },
-    public_hdrs = [
-        "//c:engine.h",
-        "//schema/capabilities:capabilities_c.h",
-    ],
+    public_hdrs = C_LITERT_LM_PUBLIC_HDRS,
     deps = [
         ":CLiteRTLM_objc",
     ],
@@ -149,7 +162,7 @@ macos_dylib(
     features = ["exported_symbols"],
     linkopts = [
         "-undefined dynamic_lookup",
-        "-install_name @rpath/CLiteRTLM_mac.dylib",
+        "-install_name @rpath/libCLiteRTLM_mac.dylib",
     ],
     minimum_os_version = "12.0",
     visibility = ["//visibility:public"],
@@ -171,28 +184,36 @@ genrule(
     name = "CLiteRTLM_mac",
     srcs = [
         ":CLiteRTLM_universal",
-        "//c:engine.h",
-        "//schema/capabilities:capabilities_c.h",
-    ],
+    ] + C_LITERT_LM_PUBLIC_HDRS,
     outs = ["CLiteRTLM_mac.zip"],
     cmd = """
        mkdir -p CLiteRTLM_mac/Headers
        # Copy the universal dylib
-       cp $(location :CLiteRTLM_universal) CLiteRTLM_mac/CLiteRTLM_mac.dylib
+       cp $(location :CLiteRTLM_universal) CLiteRTLM_mac/libCLiteRTLM_mac.dylib
        # Copy the headers
+       cp $(location //c:api_export.h) CLiteRTLM_mac/Headers/
+       cp $(location //c:conversation.h) CLiteRTLM_mac/Headers/
+       cp $(location //c:embedding_engine.h) CLiteRTLM_mac/Headers/
        cp $(location //c:engine.h) CLiteRTLM_mac/Headers/
-       cp $(location //schema/capabilities:capabilities_c.h) CLiteRTLM_mac/Headers/
+       cp $(location //c:error_reporter.h) CLiteRTLM_mac/Headers/
+       cp $(location //c:experimental.h) CLiteRTLM_mac/Headers/
+       cp $(location //c:model_info.h) CLiteRTLM_mac/Headers/
        # Create module map
        cat << 'EOF' > CLiteRTLM_mac/Headers/module.modulemap
 module CLiteRTLM {
+   header "api_export.h"
+   header "conversation.h"
+   header "embedding_engine.h"
    header "engine.h"
-   header "capabilities_c.h"
+   header "error_reporter.h"
+   header "experimental.h"
+   header "model_info.h"
    export *
 }
 EOF
        # Zip it all up
        zip -r $@ CLiteRTLM_mac
-   """,
+    """,
     visibility = ["//visibility:public"],
 )
 
@@ -241,11 +262,11 @@ ios_unit_test(
     ],
 )
 
-# Swift library containing test sources for Capabilities.
+# Swift library containing test sources for ModelInfo.
 swift_library(
-    name = "LiteRT_LM_CapabilitiesTestsLib",
+    name = "LiteRT_LM_ModelInfoTestsLib",
     testonly = True,
-    srcs = ["CapabilitiesTests.swift"],
+    srcs = ["ModelInfoTests.swift"],
     copts = ["-enable-testing"],
     data = ["//runtime/testdata"],
     deps = [
@@ -255,13 +276,37 @@ swift_library(
 )
 
 ios_unit_test(
-    name = "LiteRT_LM_Capabilities_Tests",
+    name = "LiteRT_LM_ModelInfo_Tests",
     data = [
         "//runtime/testdata",
     ],
     minimum_os_version = "15.0",
     # The ios_unit_test depends on the swift_library containing the test code.
     deps = [
-        ":LiteRT_LM_CapabilitiesTestsLib",
+        ":LiteRT_LM_ModelInfoTestsLib",
+    ],
+)
+
+# Swift library containing test sources for EmbeddingEngine.
+swift_library(
+    name = "LiteRT_LM_EmbeddingEngineTestsLib",
+    testonly = True,
+    srcs = ["EmbeddingEngineTests.swift"],
+    data = ["//runtime/testdata"],
+    deps = [
+        ":LiteRT_LM_Swift",
+
+    ],
+)
+
+ios_unit_test(
+    name = "LiteRT_LM_EmbeddingEngine_Tests",
+    data = [
+        "//runtime/testdata",
+    ],
+    minimum_os_version = "15.0",
+    # The ios_unit_test depends on the swift_library containing the test code.
+    deps = [
+        ":LiteRT_LM_EmbeddingEngineTestsLib",
     ],
 )

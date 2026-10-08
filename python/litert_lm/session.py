@@ -15,10 +15,11 @@
 
 import collections.abc
 import ctypes
+import pathlib
 import queue
+import warnings
 from . import interfaces
 from ._ffi import InputDataType
-from ._ffi import LiteRtLmInputData
 from ._ffi import STREAM_CALLBACK_TYPE
 
 
@@ -51,21 +52,27 @@ class Session(interfaces.AbstractSession):
 
   def run_prefill(self, contents: list[str]) -> None:
     num_inputs = len(contents)
-    inputs = (LiteRtLmInputData * num_inputs)()
-    # Keep strings alive during call
-    keep_alive = []
-    for i, text in enumerate(contents):
-      encoded_text = text.encode("utf-8")
-      keep_alive.append(encoded_text)
-      inputs[i].type = InputDataType.TEXT
-      inputs[i].data = ctypes.cast(
-          ctypes.c_char_p(encoded_text), ctypes.c_void_p
-      )
-      inputs[i].size = len(encoded_text)
+    inputs = (ctypes.c_void_p * num_inputs)()
+    created_inputs = []
+    try:
+      for i, text in enumerate(contents):
+        encoded_text = text.encode("utf-8")
+        input_ptr = self._lib.litert_lm_input_data_create(
+            InputDataType.TEXT, encoded_text, len(encoded_text)
+        )
+        if not input_ptr:
+          raise RuntimeError("Failed to create LiteRtLmInputData")
+        created_inputs.append(input_ptr)
+        inputs[i] = input_ptr
 
-    res = self._lib.litert_lm_session_run_prefill(self._ptr, inputs, num_inputs)
-    if res != 0:
-      raise RuntimeError("litert_lm_session_run_prefill failed")
+      res = self._lib.litert_lm_session_run_prefill(
+          self._ptr, inputs, num_inputs
+      )
+      if res != 0:
+        raise RuntimeError("litert_lm_session_run_prefill failed")
+    finally:
+      for input_ptr in created_inputs:
+        self._lib.litert_lm_input_data_delete(input_ptr)
 
   def run_decode(self) -> interfaces.Responses:
     resp_ptr = self._lib.litert_lm_session_run_decode(self._ptr)
@@ -76,10 +83,13 @@ class Session(interfaces.AbstractSession):
   def run_decode_async(self) -> collections.abc.Iterator[interfaces.Responses]:
     q = queue.Queue()
 
-    def callback(unused_data, chunk, is_final, error_msg):
+    def callback(unused_data, chunk_ptr):
+      error_msg = self._lib.litert_lm_stream_chunk_get_error(chunk_ptr)
       if error_msg:
         q.put(RuntimeError(error_msg.decode("utf-8")))
       else:
+        chunk = self._lib.litert_lm_stream_chunk_get_text(chunk_ptr)
+        is_final = self._lib.litert_lm_stream_chunk_is_final(chunk_ptr)
         q.put((chunk.decode("utf-8") if chunk else "", is_final))
 
     c_callback = STREAM_CALLBACK_TYPE(callback)
@@ -153,6 +163,67 @@ class Session(interfaces.AbstractSession):
     finally:
       self._lib.litert_lm_responses_delete(resp_ptr)
 
+  def get_benchmark_info(self) -> interfaces.BenchmarkInfo:
+    """See base class."""
+    if not self._ptr:
+      raise RuntimeError("Session is closed.")
+    info_ptr = self._lib.litert_lm_session_get_benchmark_info(self._ptr)
+    if not info_ptr:
+      raise RuntimeError("Failed to get benchmark info.")
+    try:
+      return interfaces.create_benchmark_info(self._lib, info_ptr)
+    finally:
+      self._lib.litert_lm_benchmark_info_delete(info_ptr)
+
   def cancel_process(self) -> None:
     if self._ptr:
       self._lib.litert_lm_session_cancel_process(self._ptr)
+
+  def get_debug_artifacts(self) -> interfaces.DebugArtifacts | None:
+    """See base class."""
+    if not self._lib.litert_lm_experimental_is_debugger_enabled():
+      warnings.warn(
+          "LiteRT-LM Debugger is disabled in this runtime build. "
+          "To enable artifact tracing, re-compile using "
+          "'--define LITERT_LM_DEBUGGER_ENABLED=1'.",
+          RuntimeWarning,
+          stacklevel=2,
+      )
+      return None
+
+    if not self._engine or not self._engine.cache_dir:
+      return None
+
+    debug_info_ptr = self._lib.litert_lm_experimental_session_get_debug_info(
+        self._ptr
+    )
+    if not debug_info_ptr:
+      return None
+
+    try:
+      capture_dir_bytes = (
+          self._lib.litert_lm_experimental_session_debug_info_get_capture_dir(
+              debug_info_ptr
+          )
+      )
+      if not capture_dir_bytes:
+        return None
+      capture_dir_str = capture_dir_bytes.decode("utf-8")
+    finally:
+      self._lib.litert_lm_experimental_session_debug_info_delete(debug_info_ptr)
+
+    if not capture_dir_str:
+      return None
+
+    session_dir = pathlib.Path(self._engine.cache_dir) / capture_dir_str
+    if not session_dir.exists() or not session_dir.is_dir():
+      return None
+
+    tensor_paths = sorted(session_dir.glob("*.safetensors"))
+    trace_log = session_dir / "generated_tokens.jsonl"
+    trace_log_path = trace_log if trace_log.exists() else None
+
+    return interfaces.DebugArtifacts(
+        tensor_paths=tensor_paths,
+        trace_log_path=trace_log_path,
+    )

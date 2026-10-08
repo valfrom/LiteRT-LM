@@ -1,0 +1,62 @@
+name: LiteRTValidation
+options:
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: SJN77P258L
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    ENABLE_TESTABILITY: YES
+targets:
+  LiteRTValidation:
+    type: application
+    platform: iOS
+    sources:
+      - AppDelegate.swift
+      - path: ${GEMMA4_MODEL_BUNDLE}
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.TapMedia.LiteRTValidation
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      - framework: ${LITERT_FRAMEWORK_ROOT}/CLiteRTLM.xcframework
+        embed: true
+      - framework: ${LITERT_FRAMEWORK_ROOT}/GemmaModelConstraintProvider.xcframework
+        embed: true
+      - framework: ${LITERT_FRAMEWORK_ROOT}/LiteRtMetalAccelerator.xcframework
+        embed: true
+        link: false
+      - framework: ${LITERT_FRAMEWORK_ROOT}/LiteRtTopKMetalSampler.xcframework
+        embed: true
+        link: false
+  LiteRTValidationTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - LiteRTDeviceTests.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.TapMedia.LiteRTValidationTests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/LiteRTValidation.app/LiteRTValidation"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: LiteRTValidation
+      - framework: ${LITERT_FRAMEWORK_ROOT}/CLiteRTLM.xcframework
+        embed: false
+schemes:
+  LiteRTValidation:
+    build:
+      targets:
+        LiteRTValidation: all
+        LiteRTValidationTests: [test]
+    test:
+      targets:
+        - LiteRTValidationTests
+      gatherCoverageData: false

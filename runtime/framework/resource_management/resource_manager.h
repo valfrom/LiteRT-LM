@@ -31,12 +31,12 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_settings.h"
-#include "runtime/executor/vision_executor.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/vision/vision_executor.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/framework/resource_management/context_handler/context_handler.h"
 
 namespace litert::lm {
@@ -67,7 +67,7 @@ class ResourceManager {
       ::litert::Environment* absl_nullable litert_env,
       std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr);
 
-  ~ResourceManager() = default;
+  ~ResourceManager();
 
   // Assigns the lora id from the given lora path or scoped file. If no lora is
   // used, will return std::nullopt instead of an uint32_t id.
@@ -90,7 +90,8 @@ class ResourceManager {
   // If a session specific lora is provided, the lora will be loaded and the
   // corresponding lora id will be assigned.
   absl::StatusOr<std::unique_ptr<ContextHandler>> CreateContextHandler(
-      const SessionConfig& session_config);
+      const SessionConfig& session_config) ABSL_LOCKS_EXCLUDED(executor_mutex_)
+      ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
 
   // Clones the context handler.
   // The cloned context handler will have the same shared processed context as
@@ -99,7 +100,9 @@ class ResourceManager {
   // be copied from the original context handler, thus the values will initially
   // be the same, but can be different afterward.
   absl::StatusOr<std::unique_ptr<ContextHandler>> CloneContextHandler(
-      std::shared_ptr<const ContextHandler> llm_context_handler);
+      std::shared_ptr<const ContextHandler> llm_context_handler)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_)
+          ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
 
   // Acquires the executor without any context handler. This function should
   // only be called when the usage of the returned executor does not involve any
@@ -144,6 +147,18 @@ class ResourceManager {
   // Returns the vision executor properties.
   absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
       ABSL_LOCKS_EXCLUDED(vision_executor_mutex_);
+
+  // Resets the LLM executor and clears the current context handler.
+  void ResetCurrentHandler() ABSL_LOCKS_EXCLUDED(executor_mutex_);
+
+  // Updates whether to enable Metal residency set on GPU at runtime.
+  absl::Status UpdateGpuEnableMetalResidencySet(bool enable_metal_residency_set)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_);
+
+  // Updates the LLM executor settings.
+  absl::Status UpdateExecutorSettings(
+      const LlmExecutorSettings& executor_settings)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_);
 
  private:
   // Creates the litert environment if it is not created yet.

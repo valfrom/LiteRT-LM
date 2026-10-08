@@ -30,4 +30,6 @@ filegroup(
 exports_files([
     "have_a_wonderful_day.wav",
     "colored_rect_163_586_615_957.jpg",
+    "test_lm.litertlm",
+    "test_embedding.litertlm",
 ])

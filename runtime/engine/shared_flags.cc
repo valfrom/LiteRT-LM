@@ -21,8 +21,9 @@
 #include "absl/flags/flag.h"  // from @com_google_absl
 
 ABSL_FLAG(std::optional<std::string>, vision_backend, std::nullopt,
-          "Backend to use for the vision model (cpu or gpu). If not specified, "
-          "the vision backend will be chosen based on the main backend.");
+          "Backend to use for the vision model (cpu, gpu, or npu). If not "
+          "specified, the vision backend will be chosen based on the main "
+          "backend.");
 ABSL_FLAG(std::optional<std::string>, audio_backend, std::nullopt,
           "Backend to use for the audio model (cpu or gpu). If not specified, "
           "the audio backend will be chosen based on the main backend.");
@@ -43,9 +44,14 @@ ABSL_FLAG(int, max_num_tokens, 0,
           "will be set to one equal to or greater than "
           "benchmark_prefill_tokens + benchmark_decode_tokens.");
 ABSL_FLAG(int, max_output_tokens, -1,
-          "Maximum number of output tokens for generation.");
+          "Maximum number of output tokens for generation. For thinking "
+          "models, both thinking (reasoning) tokens and the final response "
+          "tokens count towards this limit.");
 ABSL_FLAG(int, max_num_images, 1,
           "Maximum number of images to use for LLM execution.");
+ABSL_FLAG(int, visual_token_budget, -1,
+          "Visual token budget for multimodal processing (maximum number of "
+          "vision tokens per image).");
 ABSL_FLAG(std::vector<std::string>, prefill_batch_sizes, {},
           "A list of maximum numbers of prefill tokens processed at once. If "
           "empty, it will be the list of one entry with the length of input "
@@ -55,6 +61,7 @@ ABSL_FLAG(int, num_output_candidates, 1,
           "The number of candidates generated for the given prompt, or the "
           "batch size of the decode signature.");
 ABSL_FLAG(bool, benchmark, false, "Benchmark the LLM execution.");
+ABSL_FLAG(bool, enable_profiling, false, "Enable per-op profiling.");
 ABSL_FLAG(int, benchmark_prefill_tokens, 0,
           "If benchmark is true and the value is larger than 0, the benchmark "
           "will use this number to set the number of prefill tokens "
@@ -74,6 +81,8 @@ ABSL_FLAG(bool, multi_turns, false,
 ABSL_FLAG(int, num_cpu_threads, 0,
           "If greater than 0, the number of CPU threads to use for the LLM "
           "execution with CPU backend.");
+ABSL_FLAG(bool, enable_ynnpack, false,
+          "Delegate supported CPU operations to YNNPACK before XNNPACK.");
 ABSL_FLAG(bool, gpu_external_tensor_mode, false,
           "If false (by default), the GPU backend will use no external tensor "
           "mode which runs slightly faster during decode. It should be set "
@@ -97,7 +106,14 @@ ABSL_FLAG(std::string, score_target_text, "", "Target text to score.");
 ABSL_FLAG(bool, gpu_madvise_original_shared_tensors, true,
           "If true, the GPU backend will madvise the original shared tensors "
           "after use.");
-ABSL_FLAG(bool, disable_cache, false, "Disable weight cache.");
+ABSL_FLAG(
+    bool, disable_cache, false,
+    "Disable both the weight and program caches. If set to true, "
+    "--disable_weight_cache and --disable_gpu_program_cache will be ignored.");
+ABSL_FLAG(bool, disable_weight_cache, false,
+          "Disable only the weight cache. Applies to both CPU and GPU.");
+ABSL_FLAG(bool, disable_gpu_program_cache, false,
+          "Disable only the program cache. GPU path only.");
 ABSL_FLAG(
     std::string, cache_dir, "",
     "Directory for cache. Use ':memory' for in-memory cache. CPU path only");
@@ -142,6 +158,30 @@ ABSL_FLAG(bool, cache_compiled_shaders_only, false,
           "If true, only the compiled shaders will be cached. If false, gpu "
           "graph info including work group sizes (and all compiled shaders "
           "depending on backend) will be cached.");
+ABSL_FLAG(double, repetition_penalty, 1.0,
+          "Multiplicative penalty for any token already generated. "
+          "Values >= 1.0 (e.g., 1.0 = no penalty, 1.2 = moderate penalty). "
+          "Positive logits are divided by this penalty, and negative logits "
+          "are multiplied.");
+ABSL_FLAG(double, presence_penalty, 0.0,
+          "Scalar subtracted globally from a logit if a token has appeared at "
+          "least once within the currently generated sequence.");
+ABSL_FLAG(
+    double, frequency_penalty, 0.0,
+    "Scalar subtracted from a token's logit, scaled linearly by the number "
+    "of times that token has previously appeared.");
+ABSL_FLAG(int, repetition_window_size, 0,
+          "The maximum number of recent tokens to consider for penalization. "
+          "Tokens older than this are forgotten. 0 means track all history.");
+ABSL_FLAG(int, no_repeat_ngram_size, 0,
+          "If greater than 0, all ngrams of this size can only occur once in "
+          "the generated sequence. The logits of the banned tokens will be set "
+          "to -inf.");
+ABSL_FLAG(int, no_repeat_ngram_window_size, 0,
+          "The maximum number of recent tokens to consider for banning. "
+          "Tokens older than this are forgotten. 0 means track all history.");
+ABSL_FLAG(std::string, suppress_tokens, "",
+          "A comma-separated list of tokens to suppress.");
 ABSL_FLAG(std::string, constraint_regex, "",
           "Regular expression to constrain the output generation.");
 ABSL_FLAG(bool, use_submodel, false,
@@ -157,3 +197,13 @@ ABSL_FLAG(bool, use_hw_cache_update_for_npu, true,
 ABSL_FLAG(bool, use_hw_ple_for_npu, true, "If true, use HW PLE for NPU.");
 ABSL_FLAG(bool, enable_npu_debug_logging, false,
           "If true, enable debug logging for NPU.");
+ABSL_FLAG(
+    bool, disable_input_prompt_as_hint, false,
+    "If true, disable the input prompt as a hint when creating the engine. "
+    "This is useful to align the behavior of other languages with C++, where "
+    "the input prompt is not used as a hint.");
+ABSL_FLAG(bool, gpu_enable_metal_residency_set, false,
+          "If true, enable metal residency set for GPU backend which prevents "
+          "model weigths from being swapped out from memory. Note that it will "
+          "increase the memory pressure for other applications and may cause "
+          "others' crash with out-of-memory failures.");

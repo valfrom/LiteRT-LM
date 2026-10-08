@@ -22,19 +22,41 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/ascii.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_model.h"  // from @litert
-#include "runtime/components/tokenizer.h"
+#ifdef ENABLE_HUGGINGFACE_TOKENIZER
+#include "support/tokenizer/huggingface_tokenizer.h"
+#endif  // ENABLE_HUGGINGFACE_TOKENIZER
+#ifdef ENABLE_SENTENCEPIECE_TOKENIZER
+#include "support/tokenizer/sentencepiece_tokenizer.h"
+#endif  // ENABLE_SENTENCEPIECE_TOKENIZER
+#include "runtime/proto/asr_metadata.pb.h"
+#include "runtime/proto/embedding_metadata.pb.h"
+#include "runtime/proto/executor_metadata.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
+#include "runtime/proto/tts_metadata.pb.h"
 #include "runtime/util/scoped_file.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
+
+#ifdef ENABLE_HUGGINGFACE_TOKENIZER
+using ::litert::support::HuggingFaceTokenizer;
+#endif  // ENABLE_HUGGINGFACE_TOKENIZER
+#ifdef ENABLE_SENTENCEPIECE_TOKENIZER
+using ::litert::support::SentencePieceTokenizer;
+#endif  // ENABLE_SENTENCEPIECE_TOKENIZER
+using ::litert::support::Tokenizer;
 
 enum class ModelType {
   kUnknown = 0,              // Placeholder for uninitialized model type.
@@ -54,6 +76,7 @@ enum class ModelType {
   kArtisanTextDecoder = 11,  // The text decoder model for the artisan gpu.
   kTfLiteMtpDrafter = 13,    // The MTP drafter model.
   kTfLiteMtpAux = 14,        // The MTP auxiliary model.
+  kTfLiteTextEncoder = 15,   // The text encoder for an embedding model.
 };
 
 // Utility function to convert a string to ModelType. It's case insensitive.
@@ -89,6 +112,8 @@ inline absl::StatusOr<ModelType> StringToModelType(
     return ModelType::kTfLiteMtpDrafter;
   } else if (lower_case_model_type_str == "tf_lite_mtp_aux") {
     return ModelType::kTfLiteMtpAux;
+  } else if (lower_case_model_type_str == "tf_lite_text_encoder") {
+    return ModelType::kTfLiteTextEncoder;
   } else {
     return absl::InvalidArgumentError(
         absl::StrCat("Unknown model type: ", model_type_str));
@@ -126,12 +151,32 @@ inline std::string ModelTypeToString(ModelType model_type) {
       return "TF_LITE_MTP_DRAFTER";
     case ModelType::kTfLiteMtpAux:
       return "TF_LITE_MTP_AUX";
+    case ModelType::kTfLiteTextEncoder:
+      return "TF_LITE_TEXT_ENCODER";
     case ModelType::kUnknown:
       return "UNKNOWN";
     default:
       return "INVALID";
   }
 }
+
+// LITE_RUNTIME compatible helper functions converting capability-scoped
+// Protobuf TfLiteModelType enums to canonical lowercase wire strings.
+std::string TfLiteModelTypeToWireString(
+    proto::LlmMetadata::TfLiteModelType model_type);
+std::string TfLiteModelTypeToWireString(
+    proto::EmbeddingMetadata::TfLiteModelType model_type);
+std::string TfLiteModelTypeToWireString(
+    proto::TtsMetadata::TfLiteModelType model_type);
+std::string TfLiteModelTypeToWireString(
+    proto::AsrMetadata::TfLiteModelType model_type);
+std::string TfLiteModelTypeToWireString(ModelType model_type);
+
+// Describes the location of a contiguous region of bytes in a file.
+struct FileRegion {
+  size_t offset;
+  size_t size;
+};
 
 // ModelResources is an interface that manages all the loaded model resources
 // that need to be hold to avoid the model being destroyed. It provides a way
@@ -151,6 +196,26 @@ class ModelResources {
   virtual absl::StatusOr<const litert::Model*> GetTFLiteModel(
       ModelType model_type) = 0;
 
+  // Returns the litert model for the given model type string, for LLM Engine.
+  virtual absl::StatusOr<const litert::Model*> GetTFLiteModel(
+      absl::string_view model_type_str);
+
+  // Returns the litert model for the given TfLiteModelTypeT, for supported
+  // capability-scoped Engines. Here TfLiteModelTypeT is an enum type defined in
+  // the capability-scoped metadata proto, e.g.
+  // - proto::LlmMetadata::TfLiteModelType,
+  // - proto::EmbeddingMetadata::TfLiteModelType,
+  // - proto::TtsMetadata::TfLiteModelType
+  // - proto::AsrMetadata::TfLiteModelType.
+  template <
+      typename TfLiteModelTypeT,
+      typename = std::enable_if_t<std::is_enum_v<TfLiteModelTypeT> &&
+                                  !std::is_same_v<TfLiteModelTypeT, ModelType>>>
+  absl::StatusOr<const litert::Model*> GetTFLiteModel(
+      TfLiteModelTypeT model_type) {
+    return GetTFLiteModel(TfLiteModelTypeToWireString(model_type));
+  }
+
   // Returns the TFLite model buffer. Note that the returned string_view is
   // valid only until the ModelResources is destroyed.
   // When there is no model for the given model type, it will return an error
@@ -160,6 +225,27 @@ class ModelResources {
   virtual absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
       ModelType model_type) = 0;
 
+  // Returns the TFLite model buffer for the given model type string, for LLM
+  // Engine.
+  virtual absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
+      absl::string_view model_type_str);
+
+  // Returns the TFLite model buffer for the given TfLiteModelTypeT, for
+  // supported capability-scoped Engines. Here TfLiteModelTypeT is an enum type
+  // defined in the capability-scoped metadata proto, e.g.
+  // - proto::LlmMetadata::TfLiteModelType,
+  // - proto::EmbeddingMetadata::TfLiteModelType,
+  // - proto::TtsMetadata::TfLiteModelType
+  // - proto::AsrMetadata::TfLiteModelType.
+  template <
+      typename TfLiteModelTypeT,
+      typename = std::enable_if_t<std::is_enum_v<TfLiteModelTypeT> &&
+                                  !std::is_same_v<TfLiteModelTypeT, ModelType>>>
+  absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
+      TfLiteModelTypeT model_type) {
+    return GetTFLiteModelBuffer(TfLiteModelTypeToWireString(model_type));
+  }
+
   // Returns the reference to the ScopedFile. This is used for the getting the
   // external weights that should not be mmapped into the memory.
   virtual absl::StatusOr<std::reference_wrapper<ScopedFile>>
@@ -167,6 +253,10 @@ class ModelResources {
 
   // Returns the section start offset and end offset.
   virtual absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
+      ModelType model_type) = 0;
+
+  // Returns the region of the requested ModelType in the ModelResources.
+  virtual absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
       ModelType model_type) = 0;
 
   // Returns the TFLite model backend constraint. When there is no constraint
@@ -183,8 +273,69 @@ class ModelResources {
   // Builds a tokenizer instance from the model and returns it.
   virtual absl::StatusOr<std::unique_ptr<Tokenizer>> GetTokenizer() = 0;
 
+  // Builds a tokenizer instance for the specified model type and returns it.
+  // Defaults to GetTokenizer() when model_type is kTfLitePrefillDecode.
+  virtual absl::StatusOr<std::unique_ptr<Tokenizer>> GetTokenizer(
+      ModelType model_type) {
+    if (model_type == ModelType::kTfLitePrefillDecode) {
+      return GetTokenizer();
+    }
+    return absl::UnimplementedError(absl::StrCat("GetTokenizer for model type ",
+                                                 ModelTypeToString(model_type),
+                                                 " is not implemented."));
+  }
+
+  // Returns a tokenizer for `model_type`, creating it on first use and
+  // re-using it afterwards. Ownership stays with ModelResources; the returned
+  // pointer is valid for the lifetime of this object.
+  virtual absl::StatusOr<const Tokenizer*> GetOrCreateTokenizer(
+      ModelType model_type) {
+    return absl::UnimplementedError(
+        absl::StrCat("GetOrCreateTokenizer for model type ",
+                     ModelTypeToString(model_type), " is not implemented."));
+  }
+
   // Returns the llm metadata.
   virtual absl::StatusOr<const proto::LlmMetadata*> GetLlmMetadata() = 0;
+
+  // Returns the executor metadata.
+  virtual absl::StatusOr<const proto::ExecutorMetadata*>
+  GetExecutorMetadata() = 0;
+
+  // Returns the embedding metadata.
+  virtual absl::StatusOr<const proto::EmbeddingMetadata*>
+  GetEmbeddingMetadata() {
+    return absl::UnimplementedError("GetEmbeddingMetadata is not implemented.");
+  }
+
+  // Returns the TTS metadata.
+  virtual absl::StatusOr<const proto::TtsMetadata*> GetTtsMetadata() {
+    return absl::UnimplementedError("GetTtsMetadata is not implemented.");
+  }
+
+  // Returns the ASR metadata.
+  virtual absl::StatusOr<const proto::AsrMetadata*> GetAsrMetadata() {
+    return absl::UnimplementedError("GetAsrMetadata is not implemented.");
+  }
+
+  // Returns a zero-copy buffer for a GenericBinaryData section matching the
+  // given name.
+  virtual absl::StatusOr<absl::string_view> GetGenericBinaryDataBuffer(
+      absl::string_view name) {
+    return absl::UnimplementedError(
+        "GetGenericBinaryDataBuffer is not implemented.");
+  }
+
+  // Returns the names of all named GenericBinaryData sections in the model
+  // container.
+  virtual std::vector<std::string> GetGenericBinaryDataNames() const;
+
+  // Returns in-memory weights for a specific model type if available.
+  // Used by the streaming weights API when running a model on CPU.
+  virtual const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+  GetWeightInMemoryMap(ModelType model_type) const {
+    return nullptr;
+  }
 };
 
 }  // namespace litert::lm

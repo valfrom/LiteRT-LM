@@ -21,28 +21,32 @@
 #include <gtest/gtest.h>
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 #include "runtime/util/test_utils.h"  // NOLINT
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
 
 using ::testing::NiceMock;
 using ::testing::Return;
+using TokenizerType = ::litert::support::TokenizerType;
 
 class MockTokenizer : public Tokenizer {
  public:
   MOCK_METHOD(absl::StatusOr<std::string>, TokenIdsToText,
-              (const std::vector<int>& token_ids), (override));
+              (absl::Span<const int> token_id, bool skip_special_tokens),
+              (override));
   MOCK_METHOD(absl::StatusOr<std::vector<int>>, TextToTokenIds,
               (absl::string_view text), (override));
   MOCK_METHOD(absl::StatusOr<int>, TokenToId, (absl::string_view token),
               (override));
   MOCK_METHOD(TokenizerType, GetTokenizerType, (), (const, override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
+  MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
 TEST(ModelTypeUtilsTest, InferLlmModelTypeGemma3N) {
@@ -111,9 +115,12 @@ TEST(ModelTypeUtilsTest, GetDefaultJinjaPromptTemplate) {
   PromptTemplate prompt_template(jinja_prompt_template);
   PromptTemplateInput prompt_template_input;
   prompt_template_input.messages = {
-      {{"role", "system"}, {"content", "This is a system message"}},
-      {{"role", "user"}, {"content", "This is a user message"}},
-      {{"role", "model"}, {"content", "This is a model message"}}};
+      {{"role", "system"},
+       {"content", {{{"type", "text"}, {"text", "This is a system message"}}}}},
+      {{"role", "user"},
+       {"content", {{{"type", "text"}, {"text", "This is a user message"}}}}},
+      {{"role", "assistant"},
+       {"content", {{{"type", "text"}, {"text", "This is a model message"}}}}}};
   ASSERT_OK_AND_ASSIGN(auto rendered_prompt,
                        prompt_template.Apply(prompt_template_input));
   EXPECT_EQ(rendered_prompt,
@@ -133,9 +140,12 @@ TEST(ModelTypeUtilsTest, GetDefaultJinjaPromptTemplateEmpty) {
   PromptTemplate prompt_template(jinja_prompt_template);
   PromptTemplateInput prompt_template_input;
   prompt_template_input.messages = {
-      {{"role", "system"}, {"content", "This is a system message"}},
-      {{"role", "user"}, {"content", "This is a user message"}},
-      {{"role", "model"}, {"content", "This is a model message"}}};
+      {{"role", "system"},
+       {"content", {{{"type", "text"}, {"text", "This is a system message"}}}}},
+      {{"role", "user"},
+       {"content", {{{"type", "text"}, {"text", "This is a user message"}}}}},
+      {{"role", "assistant"},
+       {"content", {{{"type", "text"}, {"text", "This is a model message"}}}}}};
   ASSERT_OK_AND_ASSIGN(auto rendered_prompt,
                        prompt_template.Apply(prompt_template_input));
   EXPECT_EQ(rendered_prompt,
@@ -160,7 +170,8 @@ TEST(ModelTypeUtilsTest, GetDefaultJinjaPromptTemplateWithImageAndAudio) {
   PromptTemplate prompt_template(jinja_prompt_template);
   PromptTemplateInput prompt_template_input;
   prompt_template_input.messages = {
-      {{"role", "system"}, {"content", "This is a system message"}},
+      {{"role", "system"},
+       {"content", {{{"type", "text"}, {"text", "This is a system message"}}}}},
       {
           {"role", "user"},
           {"content",
@@ -171,7 +182,8 @@ TEST(ModelTypeUtilsTest, GetDefaultJinjaPromptTemplateWithImageAndAudio) {
                {{"type", "audio"}, {"audio", "audio_bytes"}},
            }},
       },
-      {{"role", "model"}, {"content", "This is a model message"}}};
+      {{"role", "assistant"},
+       {"content", {{{"type", "text"}, {"text", "This is a model message"}}}}}};
   ASSERT_OK_AND_ASSIGN(auto rendered_prompt,
                        prompt_template.Apply(prompt_template_input));
   EXPECT_EQ(rendered_prompt,
@@ -180,6 +192,44 @@ TEST(ModelTypeUtilsTest, GetDefaultJinjaPromptTemplateWithImageAndAudio) {
             "is a user audio <start_of_audio><end_of_turn>\n"
             "<start_of_turn>model\nThis is a model message<end_of_turn>\n"
             "<start_of_turn>model\n");
+}
+
+TEST(ModelTypeUtilsTest, GetModelTypeName) {
+  proto::LlmModelType model_type;
+  EXPECT_EQ(GetModelTypeName(model_type), "Not set");
+
+  model_type.mutable_generic_model();
+  EXPECT_EQ(GetModelTypeName(model_type), "generic_model");
+
+  model_type.mutable_gemma3n();
+  EXPECT_EQ(GetModelTypeName(model_type), "gemma3n");
+
+  model_type.mutable_function_gemma();
+  EXPECT_EQ(GetModelTypeName(model_type), "function_gemma");
+
+  model_type.mutable_gemma3();
+  EXPECT_EQ(GetModelTypeName(model_type), "gemma3");
+
+  model_type.mutable_qwen3();
+  EXPECT_EQ(GetModelTypeName(model_type), "qwen3");
+
+  model_type.mutable_qwen2p5();
+  EXPECT_EQ(GetModelTypeName(model_type), "qwen2p5");
+
+  model_type.mutable_gemma4();
+  EXPECT_EQ(GetModelTypeName(model_type), "gemma4");
+
+  model_type.mutable_fast_vlm();
+  EXPECT_EQ(GetModelTypeName(model_type), "fast_vlm");
+
+  model_type.mutable_lfm2();
+  EXPECT_EQ(GetModelTypeName(model_type), "lfm2");
+
+  model_type.mutable_minicpm5();
+  EXPECT_EQ(GetModelTypeName(model_type), "minicpm5");
+
+  model_type.mutable_minicpmv4();
+  EXPECT_EQ(GetModelTypeName(model_type), "minicpmv4");
 }
 
 }  // namespace

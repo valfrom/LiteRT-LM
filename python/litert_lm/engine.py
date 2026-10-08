@@ -24,16 +24,17 @@ import warnings
 from . import interfaces
 from . import tools as litert_tools
 from ._ffi import _get_lib
-from ._ffi import TokenUnionType
+from ._ffi import ActivationDataType
 from ._messages import Message
 from .conversation import Conversation
 from .session import Session
 from .utils import _parse_token_union
 from .utils import _sampler_config_to_params
+from .utils import thinking_config_to_params
 
 
-# TODO: b/482060476 - Drop support for passing Backend class in 0.13.0.
 def _normalize_backend(backend: Any) -> Any:
+  # TODO: b/482060476 - Drop support for passing Backend class in 0.13.0.
   if isinstance(backend, type) and issubclass(backend, interfaces.Backend):
     warnings.warn(
         f"Passing Backend class {backend.__name__} is deprecated. "
@@ -55,13 +56,19 @@ class Engine(interfaces.AbstractEngine):
           interfaces.Backend | type[interfaces.Backend]
       ) = interfaces.Backend.CPU(),
       max_num_tokens: int | None = None,
-      cache_dir: str = "",
+      max_num_images: int | None = None,
+      cache_dir: str | None = None,
       vision_backend: (
           interfaces.Backend | type[interfaces.Backend] | None
       ) = None,
       audio_backend: (
           interfaces.Backend | type[interfaces.Backend] | None
       ) = None,
+      lora_rank_config: interfaces.LoraRankConfig | None = None,
+      activation_data_type: ActivationDataType | None = None,
+      enable_benchmark: bool = False,
+      use_ringbuffers_local_attention: bool | None = None,
+      enable_ynnpack: bool | None = None,
       **kwargs,
   ):
     backend = _normalize_backend(backend)
@@ -72,9 +79,14 @@ class Engine(interfaces.AbstractEngine):
         model_path=model_path,
         backend=backend,
         max_num_tokens=max_num_tokens,
+        max_num_images=max_num_images,
         cache_dir=cache_dir,
         vision_backend=vision_backend,
         audio_backend=audio_backend,
+        lora_rank_config=lora_rank_config,
+        activation_data_type=activation_data_type,
+        use_ringbuffers_local_attention=use_ringbuffers_local_attention,
+        enable_ynnpack=enable_ynnpack,
         **kwargs,
     )
 
@@ -87,6 +99,9 @@ class Engine(interfaces.AbstractEngine):
         (self.vision_backend.get_name() if self.vision_backend else None),
         (self.audio_backend.get_name() if self.audio_backend else None),
     )
+
+    if enable_benchmark:
+      self._lib.litert_lm_engine_settings_enable_benchmark(settings)
 
     if (
         isinstance(self.backend, interfaces.Backend.NPU)
@@ -102,11 +117,36 @@ class Engine(interfaces.AbstractEngine):
           "Verify the model path and backend."
       )
 
+    if (
+        isinstance(self.backend, interfaces.CPU)
+        and self.backend.thread_count is not None
+    ):
+      self._lib.litert_lm_engine_settings_set_num_threads(
+          settings, self.backend.thread_count
+      )
+
+    if (
+        isinstance(self.audio_backend, interfaces.CPU)
+        and self.audio_backend.thread_count is not None
+    ):
+      self._lib.litert_lm_engine_settings_set_audio_num_threads(
+          settings, self.audio_backend.thread_count
+      )
+
+    if self.use_ringbuffers_local_attention is not None:
+      self._lib.litert_lm_engine_settings_set_use_ringbuffers_local_attention(
+          settings, self.use_ringbuffers_local_attention
+      )
+
     if self.max_num_tokens is not None:
       self._lib.litert_lm_engine_settings_set_max_num_tokens(
           settings, self.max_num_tokens
       )
-    if self.cache_dir:
+    if self.max_num_images is not None:
+      self._lib.litert_lm_engine_settings_set_max_num_images(
+          settings, self.max_num_images
+      )
+    if self.cache_dir is not None:
       self._lib.litert_lm_engine_settings_set_cache_dir(
           settings, self.cache_dir
       )
@@ -114,6 +154,47 @@ class Engine(interfaces.AbstractEngine):
       self._lib.litert_lm_engine_settings_set_enable_speculative_decoding(
           settings, self.enable_speculative_decoding
       )
+    if self.activation_data_type is not None:
+      self._lib.litert_lm_engine_settings_set_activation_data_type(
+          settings, self.activation_data_type.value
+      )
+    if self.enable_ynnpack is not None:
+      self._lib.litert_lm_engine_settings_set_enable_ynnpack(
+          settings, self.enable_ynnpack
+      )
+
+    lora_rank = (
+        self.lora_rank_config.lora_rank if self.lora_rank_config else None
+    )
+    audio_lora_rank = (
+        self.lora_rank_config.audio_lora_rank
+        if self.lora_rank_config
+        else None
+    )
+
+    if lora_rank is not None:
+      self._lib.litert_lm_engine_settings_set_lora_rank(settings, lora_rank)
+      if lora_rank > 0:
+        c_ranks = (ctypes.c_int * 1)(lora_rank)
+        status = self._lib.litert_lm_engine_settings_set_supported_lora_ranks(
+            settings, c_ranks, 1
+        )
+        if status != 0:
+          raise RuntimeError("Failed to set supported LoRA ranks.")
+
+    if audio_lora_rank is not None:
+      self._lib.litert_lm_engine_settings_set_audio_lora_rank(
+          settings, audio_lora_rank
+      )
+      if audio_lora_rank > 0:
+        c_ranks = (ctypes.c_int * 1)(audio_lora_rank)
+        status = (
+            self._lib.litert_lm_engine_settings_set_supported_audio_lora_ranks(
+                settings, c_ranks, 1
+            )
+        )
+        if status != 0:
+          raise RuntimeError("Failed to set supported audio LoRA ranks.")
 
     self._engine_ptr = self._lib.litert_lm_engine_create(settings)
     self._lib.litert_lm_engine_settings_delete(settings)
@@ -153,77 +234,142 @@ class Engine(interfaces.AbstractEngine):
       tool_event_handler: interfaces.ToolEventHandler | None = None,
       automatic_tool_calling: bool = True,
       extra_context: collections.abc.Mapping[str, Any] | None = None,
-      filter_channel_content_from_kv_cache: bool = False,
+      filter_channel_content_from_kv_cache: bool | None = None,
+      thinking_config: interfaces.ThinkingConfig | None = None,
       sampler_config: interfaces.SamplerConfig | None = None,
       system_message: str | None = None,
-      enable_constrained_decoding: bool = False,
+      constrained_decoding_config: (
+          interfaces.ConstrainedDecodingConfig | None
+      ) = None,
+      lora_config: interfaces.LoraConfig | None = None,
+      max_output_tokens: int | None = None,
+      chat_template: str | None = None,
+      enable_speculative_decoding: bool | None = None,
   ) -> Conversation:
     session_config = self._lib.litert_lm_session_config_create()
+    if enable_speculative_decoding is not None:
+      self._lib.litert_lm_session_config_set_enable_speculative_decoding(
+          session_config, enable_speculative_decoding
+      )
     if sampler_config:
-      params = _sampler_config_to_params(sampler_config)
-      self._lib.litert_lm_session_config_set_sampler_params(
-          session_config, ctypes.byref(params)
+      params = _sampler_config_to_params(self._lib, sampler_config)
+      try:
+        self._lib.litert_lm_session_config_set_sampler_params(
+            session_config, params
+        )
+      finally:
+        self._lib.litert_lm_sampler_params_delete(params)
+
+    lora_path = lora_config.lora_path if lora_config else None
+    audio_lora_path = lora_config.audio_lora_path if lora_config else None
+
+    if lora_path:
+      status = self._lib.litert_lm_session_config_set_lora_path(
+          session_config, lora_path
+      )
+      if status != 0:
+        raise RuntimeError(f"Failed to set LoRA path: {lora_path}")
+
+    if audio_lora_path:
+      status = self._lib.litert_lm_session_config_set_audio_lora_path(
+          session_config, audio_lora_path
+      )
+      if status != 0:
+        raise RuntimeError(f"Failed to set audio LoRA path: {audio_lora_path}")
+
+    if max_output_tokens is not None:
+      self._lib.litert_lm_session_config_set_max_output_tokens(
+          session_config, int(max_output_tokens)
       )
 
     conv_config = self._lib.litert_lm_conversation_config_create()
     if not conv_config:
       raise RuntimeError("Failed to create conversation config")
 
-    self._lib.litert_lm_conversation_config_set_session_config(
-        conv_config, session_config
-    )
-    self._lib.litert_lm_session_config_delete(session_config)
-
-    if system_message:
-      self._lib.litert_lm_conversation_config_set_system_message(
-          conv_config, system_message
+    try:
+      self._lib.litert_lm_conversation_config_set_session_config(
+          conv_config, session_config
       )
+      self._lib.litert_lm_session_config_delete(session_config)
 
-    if messages:
-      serialized_messages = [
-          m.to_json() if hasattr(m, "to_json") else m for m in messages
-      ]
-      self._lib.litert_lm_conversation_config_set_messages(
-          conv_config, json.dumps(serialized_messages)
-      )
+      if system_message:
+        self._lib.litert_lm_conversation_config_set_system_message(
+            conv_config, system_message
+        )
 
-    if extra_context:
-      self._lib.litert_lm_conversation_config_set_extra_context(
-          conv_config, json.dumps(extra_context)
-      )
+      if messages:
+        serialized_messages = [
+            m.to_json() if hasattr(m, "to_json") else m for m in messages
+        ]
+        self._lib.litert_lm_conversation_config_set_messages(
+            conv_config, json.dumps(serialized_messages)
+        )
 
-    tools_map = {}
-    if tools:
-      wrapped_tools = []
-      for t in tools:
-        if not isinstance(t, interfaces.Tool):
-          t = litert_tools.tool_from_function(t)
-        wrapped_tools.append(t)
-        desc = t.get_tool_description()
-        if "function" not in desc or "name" not in desc["function"]:
-          raise ValueError(
-              "interfaces.Tool description must contain ['function']['name']"
+      if extra_context:
+        self._lib.litert_lm_conversation_config_set_extra_context(
+            conv_config, json.dumps(extra_context)
+        )
+
+      if chat_template:
+        self._lib.litert_lm_conversation_config_set_prompt_template(
+            conv_config, chat_template.encode("utf-8")
+        )
+
+      tools_map = {}
+      if tools:
+        wrapped_tools = []
+        for t in tools:
+          if not isinstance(t, interfaces.Tool):
+            t = litert_tools.tool_from_function(t)
+          wrapped_tools.append(t)
+          desc = t.get_tool_description()
+          if "function" not in desc or "name" not in desc["function"]:
+            raise ValueError(
+                "interfaces.Tool description must contain ['function']['name']"
+            )
+          name = desc["function"]["name"]
+          tools_map[name] = t
+
+        tools_json = json.dumps(
+            [t.get_tool_description() for t in wrapped_tools]
+        )
+        self._lib.litert_lm_conversation_config_set_tools(
+            conv_config, tools_json
+        )
+
+      if constrained_decoding_config is not None:
+        if constrained_decoding_config.enable:
+          self._lib.litert_lm_conversation_config_set_enable_constrained_decoding(
+              conv_config, True
           )
-        name = desc["function"]["name"]
-        tools_map[name] = t
+        if constrained_decoding_config.provider is not None:
+          self._lib.litert_lm_conversation_config_set_constraint_provider(
+              conv_config,
+              ctypes.byref(
+                  ctypes.c_int(constrained_decoding_config.provider.value)
+              ),
+          )
 
-      tools_json = json.dumps([t.get_tool_description() for t in wrapped_tools])
-      self._lib.litert_lm_conversation_config_set_tools(conv_config, tools_json)
+      if filter_channel_content_from_kv_cache is not None:
+        self._lib.litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
+            conv_config, filter_channel_content_from_kv_cache
+        )
 
-    if enable_constrained_decoding:
-      self._lib.litert_lm_conversation_config_set_enable_constrained_decoding(
-          conv_config, True
+      if thinking_config is not None:
+        tc_ptr = thinking_config_to_params(self._lib, thinking_config)
+        try:
+          self._lib.litert_lm_conversation_config_set_thinking_config(
+              conv_config, tc_ptr
+          )
+        finally:
+          if tc_ptr:
+            self._lib.litert_lm_thinking_config_delete(tc_ptr)
+
+      conv_ptr = self._lib.litert_lm_conversation_create(
+          self._engine_ptr, conv_config
       )
-
-    if filter_channel_content_from_kv_cache:
-      self._lib.litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
-          conv_config, True
-      )
-
-    conv_ptr = self._lib.litert_lm_conversation_create(
-        self._engine_ptr, conv_config
-    )
-    self._lib.litert_lm_conversation_config_delete(conv_config)
+    finally:
+      self._lib.litert_lm_conversation_config_delete(conv_config)
 
     if not conv_ptr:
       raise RuntimeError("Failed to create conversation")
@@ -238,7 +384,12 @@ class Engine(interfaces.AbstractEngine):
         tool_event_handler=tool_event_handler,
         automatic_tool_calling=automatic_tool_calling,
         extra_context=extra_context or {},
+        thinking_config=thinking_config,
         sampler_config=sampler_config,
+        lora_config=lora_config,
+        max_output_tokens=max_output_tokens,
+        chat_template=chat_template,
+        constrained_decoding_config=constrained_decoding_config,
     )
 
   def create_session(
@@ -247,25 +398,52 @@ class Engine(interfaces.AbstractEngine):
       apply_prompt_template: bool = True,
       sampler_config: interfaces.SamplerConfig | None = None,
       max_output_tokens: int | None = None,
+      lora_config: interfaces.LoraConfig | None = None,
+      enable_speculative_decoding: bool | None = None,
   ) -> Session:
     session_config = self._lib.litert_lm_session_config_create()
     if not session_config:
       raise RuntimeError("Failed to create session config")
+
+    if enable_speculative_decoding is not None:
+      self._lib.litert_lm_session_config_set_enable_speculative_decoding(
+          session_config, enable_speculative_decoding
+      )
 
     self._lib.litert_lm_session_config_set_apply_prompt_template(
         session_config, apply_prompt_template
     )
 
     if sampler_config:
-      params = _sampler_config_to_params(sampler_config)
-      self._lib.litert_lm_session_config_set_sampler_params(
-          session_config, ctypes.byref(params)
-      )
+      params = _sampler_config_to_params(self._lib, sampler_config)
+      try:
+        self._lib.litert_lm_session_config_set_sampler_params(
+            session_config, params
+        )
+      finally:
+        self._lib.litert_lm_sampler_params_delete(params)
 
     if max_output_tokens is not None:
       self._lib.litert_lm_session_config_set_max_output_tokens(
           session_config, int(max_output_tokens)
       )
+
+    lora_path = lora_config.lora_path if lora_config else None
+    audio_lora_path = lora_config.audio_lora_path if lora_config else None
+
+    if lora_path:
+      status = self._lib.litert_lm_session_config_set_lora_path(
+          session_config, lora_path
+      )
+      if status != 0:
+        raise RuntimeError(f"Failed to set LoRA path: {lora_path}")
+
+    if audio_lora_path:
+      status = self._lib.litert_lm_session_config_set_audio_lora_path(
+          session_config, audio_lora_path
+      )
+      if status != 0:
+        raise RuntimeError(f"Failed to set audio LoRA path: {audio_lora_path}")
 
     sess_ptr = self._lib.litert_lm_engine_create_session(
         self._engine_ptr, session_config
@@ -296,7 +474,8 @@ class Engine(interfaces.AbstractEngine):
       all_ids = []
       for i in range(num):
         u_ptr = self._lib.litert_lm_token_unions_get_token_at(unions_ptr, i)
-        # _parse_token_union handles deleting the owned LiteRtLmTokenUnion pointer.
+        # _parse_token_union handles deleting the owned LiteRtLmTokenUnion
+        # pointer.
         val = _parse_token_union(self._lib, u_ptr)
         if isinstance(val, int):
           all_ids.append([val])

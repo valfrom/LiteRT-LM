@@ -12,152 +12,125 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-set(PKG_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-
 # ==============================================================================
-# 1. Audio Preprocessor Interface
+# Audio Preprocessor Interface
 # ==============================================================================
 add_litertlm_library(runtime_components_preprocessor_audio_preprocessor INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::Audio ALIAS runtime_components_preprocessor_audio_preprocessor)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::AudioInterface
+  ALIAS runtime_components_preprocessor_audio_preprocessor)
 
 target_include_directories(runtime_components_preprocessor_audio_preprocessor
   INTERFACE
     ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
+    ${LITERTLM_GENERATED_SRC_DIR}
 )
 
 # ==============================================================================
-# 2. Audio Preprocessor MiniAudio
-# ==============================================================================
-add_litertlm_library(runtime_components_preprocessor_audio_preprocessor_miniaudio STATIC
-  audio_preprocessor_miniaudio.cc
-)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::AudioMiniAudio ALIAS runtime_components_preprocessor_audio_preprocessor_miniaudio)
-
-target_include_directories(runtime_components_preprocessor_audio_preprocessor_miniaudio
-  PRIVATE
-    ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
-    ${CMAKE_BINARY_DIR}
-)
-
-target_link_libraries(runtime_components_preprocessor_audio_preprocessor_miniaudio
-  PUBLIC
-    LiteRTLM::Runtime::Components::Preprocessor::Audio
-    LiteRTLM::Runtime::Components::Preprocessor::MelFilterBank
-    runtime_engine_io_types
-    runtime_util_litert_status_util
-    LITERTLM_DEPS
-)
-
-# ==============================================================================
-# 3. Bypass Audio Preprocessor
+# Bypass Audio Preprocessor Interface
 # ==============================================================================
 add_litertlm_library(runtime_components_preprocessor_by_pass_audio_preprocessor INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::AudioBypass ALIAS runtime_components_preprocessor_by_pass_audio_preprocessor)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::AudioBypassInterface
+  ALIAS runtime_components_preprocessor_by_pass_audio_preprocessor)
 
 target_include_directories(runtime_components_preprocessor_by_pass_audio_preprocessor
   INTERFACE
     ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
+    ${LITERTLM_GENERATED_SRC_DIR}
 )
 
 # ==============================================================================
-# 4. Bypass Image Preprocessor
+# Bypass Image Preprocessor Interface
 # ==============================================================================
 add_litertlm_library(runtime_components_preprocessor_by_pass_image_preprocessor INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::ImageBypass ALIAS runtime_components_preprocessor_by_pass_image_preprocessor)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::BypassImageInterface
+  ALIAS runtime_components_preprocessor_by_pass_image_preprocessor)
 
 target_include_directories(runtime_components_preprocessor_by_pass_image_preprocessor
   INTERFACE
     ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
+    ${LITERTLM_GENERATED_SRC_DIR}
 )
 
 # ==============================================================================
-# 5. Image Preprocessor Interface
+# Image Preprocessor Interface
 # ==============================================================================
 add_litertlm_library(runtime_components_preprocessor_image_preprocessor INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::Image ALIAS runtime_components_preprocessor_image_preprocessor)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::ImageInterface
+  ALIAS runtime_components_preprocessor_image_preprocessor)
 
 target_include_directories(runtime_components_preprocessor_image_preprocessor
   INTERFACE
     ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
+    ${LITERTLM_GENERATED_SRC_DIR}
     ${CMAKE_BINARY_DIR}
 )
 
 # ==============================================================================
-# 6. Mel Filterbank
+# PIL-faithful Bicubic Resize
 # ==============================================================================
-add_litertlm_library(runtime_components_preprocessor_mel_filterbank STATIC
-  mel_filterbank.cc
+add_litertlm_library(runtime_components_preprocessor_pil_resize STATIC
+  pil_resize.cc
 )
-add_library(LiteRTLM::Runtime::Components::Preprocessor::MelFilterBank ALIAS runtime_components_preprocessor_mel_filterbank)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::PilResize
+  ALIAS runtime_components_preprocessor_pil_resize)
 
-target_include_directories(runtime_components_preprocessor_mel_filterbank
+target_include_directories(runtime_components_preprocessor_pil_resize
   PUBLIC
     ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
-    ${CMAKE_BINARY_DIR}
 )
 
-target_link_libraries(runtime_components_preprocessor_mel_filterbank
+target_link_libraries(runtime_components_preprocessor_pil_resize
   PUBLIC
     LITERTLM_DEPS
 )
 
 # ==============================================================================
-# 7. Signal Vector Util
+# MiniCPM-V Image Preprocess
+# ==============================================================================
+add_litertlm_library(runtime_components_preprocessor_minicpmv_image_preprocess STATIC
+  minicpmv_image_preprocess.cc
+)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::MiniCpmVImagePreprocess
+  ALIAS runtime_components_preprocessor_minicpmv_image_preprocess)
+
+target_include_directories(runtime_components_preprocessor_minicpmv_image_preprocess
+  PUBLIC
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_components_preprocessor_minicpmv_image_preprocess
+  PUBLIC
+    LiteRTLM::Runtime::Components::Preprocessor::PilResize
+    LiteRTLM::Runtime::Components::Preprocessor::ImageInterface
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Signal Vector Util Interface
 # ==============================================================================
 add_litertlm_library(runtime_components_preprocessor_signal_vector_util INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::SignalVectorUtil ALIAS runtime_components_preprocessor_signal_vector_util)
+add_library(LiteRTLM::Runtime::Components::Preprocessor::SignalVectorUtilInterface
+  ALIAS runtime_components_preprocessor_signal_vector_util)
 
 target_include_directories(runtime_components_preprocessor_signal_vector_util
   INTERFACE
-    ${GENERATED_SRC_DIR}
+    ${LITERTLM_GENERATED_SRC_DIR}
     ${LITERTLM_INCLUDE_PATHS}
 )
 
 # ==============================================================================
-# 8. STB Image Preprocessor
+# Folder Facade
 # ==============================================================================
-add_litertlm_library(runtime_components_preprocessor_stb_image_preprocessor STATIC
-  stb_image_preprocessor.cc
-)
-add_library(LiteRTLM::Runtime::Components::Preprocessor::StbImage ALIAS runtime_components_preprocessor_stb_image_preprocessor)
-
-target_include_directories(runtime_components_preprocessor_stb_image_preprocessor
-  PRIVATE
-    ${LITERTLM_INCLUDE_PATHS}
-    ${GENERATED_SRC_DIR}
-    ${CMAKE_BINARY_DIR}
-)
-
-target_link_libraries(runtime_components_preprocessor_stb_image_preprocessor
-  PUBLIC
-    LiteRTLM::Runtime::Components::Preprocessor::Image
-    runtime_engine_io_types
-    runtime_util_convert_tensor_buffer
-    runtime_util_litert_status_util
-    LITERTLM_DEPS
-    stb_lib
-)
-
-# ==============================================================================
-# 9. Folder Facade
-# ==============================================================================
-add_library(runtime_components_preprocessor_libs INTERFACE)
-add_library(LiteRTLM::Runtime::Components::Preprocessor ALIAS runtime_components_preprocessor_libs)
+add_litertlm_library(runtime_components_preprocessor_libs INTERFACE)
+add_library(LiteRTLM::Runtime::Components::Preprocessor
+  ALIAS runtime_components_preprocessor_libs)
 
 target_link_libraries(runtime_components_preprocessor_libs INTERFACE
-  LiteRTLM::Runtime::Components::Preprocessor::Audio
-  LiteRTLM::Runtime::Components::Preprocessor::AudioMiniAudio
-  LiteRTLM::Runtime::Components::Preprocessor::AudioBypass
-  LiteRTLM::Runtime::Components::Preprocessor::ImageBypass
-  LiteRTLM::Runtime::Components::Preprocessor::Image
-  LiteRTLM::Runtime::Components::Preprocessor::MelFilterBank
-  LiteRTLM::Runtime::Components::Preprocessor::SignalVectorUtil
-  LiteRTLM::Runtime::Components::Preprocessor::StbImage
+  LiteRTLM::Runtime::Components::Preprocessor::AudioInterface
+  LiteRTLM::Runtime::Components::Preprocessor::AudioBypassInterface
+  LiteRTLM::Runtime::Components::Preprocessor::BypassImageInterface
+  LiteRTLM::Runtime::Components::Preprocessor::ImageInterface
+  LiteRTLM::Runtime::Components::Preprocessor::MiniCpmVImagePreprocess
+  LiteRTLM::Runtime::Components::Preprocessor::PilResize
+  LiteRTLM::Runtime::Components::Preprocessor::SignalVectorUtilInterface
 )

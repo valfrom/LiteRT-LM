@@ -14,63 +14,65 @@
 
 #include "runtime/components/constrained_decoding/constrained_decoder.h"
 
-#include <cstdint>
-#include <limits>
-
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
-#include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  //NOLINT
 #include "tflite/types/half.h"  // from @litert
 
 namespace litert::lm {
 
-absl::Status ConstrainedDecoder::UpdateConstraintState(
-    const ::litert::TensorBuffer& next_token_ids) {
-  LITERT_ASSIGN_OR_RETURN(auto next_token_ids_span,
-                          ReferTensorBufferAsSpan<int>(next_token_ids));
-  return UpdateConstraintState(next_token_ids_span);
-}
-
-absl::Status ConstrainedDecoder::UpdateConstraintState(
-    absl::Span<int> next_token_ids) {
-  RET_CHECK_EQ(next_token_ids.size(), batch_size_)
-      << "Batch size [" << next_token_ids.size()
-      << "] does not match the expected batch size [" << batch_size_ << "].";
-  for (int i = 0; i < batch_size_; ++i) {
-    auto& constraint_state = constraint_states_[i];
-    ASSIGN_OR_RETURN(
-        constraint_state,
-        constraint_->ComputeNext(*constraint_state, next_token_ids[i]));
-    if (constraint_->IsEnded(*constraint_state)) {
-      constraint_state = constraint_->Start();
-    }
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ConstrainedDecoder::MaskLogits(::litert::TensorBuffer& logits) {
+absl::Status ConstrainedDecoder::ProcessLogits(::litert::TensorBuffer& logits) {
   // Compute the allowed tokens bitmap for the current constraint state.
   LITERT_ASSIGN_OR_RETURN(auto logits_tensor_type, logits.TensorType());
-  if (logits_tensor_type.ElementType() == ::litert::ElementType::Float32) {
-    LITERT_ASSIGN_OR_RETURN(auto logits_span,
-                            ReferTensorBufferAsSpan<float>(logits));
-    return MaskLogits(logits_span, logits_tensor_type.Layout().Dimensions());
-  } else if (logits_tensor_type.ElementType() ==
-             ::litert::ElementType::Float16) {
-    LITERT_ASSIGN_OR_RETURN(auto logits_span,
-                            ReferTensorBufferAsSpan<tflite::half>(logits));
-    return MaskLogits(logits_span, logits_tensor_type.Layout().Dimensions());
+  LITERT_ASSIGN_OR_RETURN(auto buffer_type, logits.BufferType());
+
+  if (buffer_type == TensorBufferType::kHostMemory) {
+    if (logits_tensor_type.ElementType() == ElementType::Float32) {
+      LITERT_ASSIGN_OR_RETURN(auto logits_span,
+                              ReferTensorBufferAsSpan<float>(logits));
+      return ProcessLogits(logits_span,
+                           logits_tensor_type.Layout().Dimensions());
+    } else if (logits_tensor_type.ElementType() == ElementType::Float16) {
+      LITERT_ASSIGN_OR_RETURN(auto logits_span,
+                              ReferTensorBufferAsSpan<tflite::half>(logits));
+      return ProcessLogits(logits_span,
+                           logits_tensor_type.Layout().Dimensions());
+    }
+  } else {
+    // For non-host memory (e.g. GPU/OpenCL/AHWB), copy the logits to CPU and
+    // mask them, then write them back.
+    if (logits_tensor_type.ElementType() == ElementType::Float32) {
+      LITERT_ASSIGN_OR_RETURN(auto logits_vector,
+                              CopyFromTensorBuffer<float>(logits));
+      ABSL_RETURN_IF_ERROR(ProcessLogits(
+          absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+          logits_tensor_type.Layout().Dimensions()));
+      LITERT_RETURN_IF_ERROR(logits.Write(
+          absl::MakeConstSpan(logits_vector.data(), logits_vector.size())));
+      return absl::OkStatus();
+    } else if (logits_tensor_type.ElementType() == ElementType::Float16) {
+      LITERT_ASSIGN_OR_RETURN(auto logits_vector,
+                              CopyFromTensorBuffer<tflite::half>(logits));
+      ABSL_RETURN_IF_ERROR(ProcessLogits(
+          absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+          logits_tensor_type.Layout().Dimensions()));
+      LITERT_RETURN_IF_ERROR(logits.Write(
+          absl::MakeConstSpan(logits_vector.data(), logits_vector.size())));
+      return absl::OkStatus();
+    }
   }
-  return absl::InvalidArgumentError("Unsupported logits type for MaskLogits.");
+  return absl::InvalidArgumentError(
+      "Unsupported logits type for ConstrainedDecoder::ProcessLogits.");
 }
 
-absl::Status ConstrainedDecoder::MaskLogits(
+absl::Status ConstrainedDecoder::ProcessLogits(
     absl::Span<float> logits,
     absl::Span<const ::litert::Layout::Dim> logits_dims) {
   RET_CHECK_EQ(logits_dims.size(), 3)
@@ -79,31 +81,22 @@ absl::Status ConstrainedDecoder::MaskLogits(
   int sequence_length = logits_dims[1];
   int vocab_size = logits_dims[2];
   RET_CHECK_EQ(sequence_length, 1) << "Only support sequence length 1.";
-  // It is possible that the constraint vocabulary size is larger than the model
-  // vocabulary size. The remaining tokens in the constraint vocabulary are
-  // treated as unused tokens.
-  RET_CHECK_LE(vocab_size, constraint_->GetVocabularySize())
-      << "Vocabulary size [" << vocab_size
-      << "] does not match the expected vocabulary size ["
-      << constraint_->GetVocabularySize() << "].";
   RET_CHECK_EQ(batch_size, batch_size_)
       << "Batch size [" << batch_size
       << "] does not match the expected batch size [" << batch_size_ << "].";
   for (int b = 0; b < batch_size; ++b) {
     auto& constraint_state = constraint_states_[b];
-    ASSIGN_OR_RETURN(auto bitmap,
-                     constraint_->ComputeBitmap(*constraint_state));
-    for (int i = 0; i < vocab_size; ++i) {
-      if (!bitmap->Get(i)) {
-        logits.data()[b * vocab_size + i] =
-            std::numeric_limits<float>::lowest();
-      }
+    ABSL_ASSIGN_OR_RETURN(auto mask,
+                          constraint_->ComputeMask(*constraint_state));
+    if (mask != nullptr) {
+      ABSL_RETURN_IF_ERROR(
+          mask->Apply(logits.subspan(b * vocab_size, vocab_size)));
     }
   }
   return absl::OkStatus();
 }
 
-absl::Status ConstrainedDecoder::MaskLogits(
+absl::Status ConstrainedDecoder::ProcessLogits(
     absl::Span<tflite::half> logits,
     absl::Span<const ::litert::Layout::Dim> logits_dims) {
   RET_CHECK_EQ(logits_dims.size(), 3)
@@ -112,24 +105,39 @@ absl::Status ConstrainedDecoder::MaskLogits(
   int sequence_length = logits_dims[1];
   int vocab_size = logits_dims[2];
   RET_CHECK_EQ(sequence_length, 1) << "Only support sequence length 1.";
-  // It is possible that the constraint vocabulary size is larger than the model
-  // vocabulary size. The remaining tokens in the constraint vocabulary are
-  // treated as unused tokens.
-  RET_CHECK_LE(vocab_size, constraint_->GetVocabularySize())
-      << "Vocabulary size [" << vocab_size
-      << "] does not match the expected vocabulary size ["
-      << constraint_->GetVocabularySize() << "].";
   RET_CHECK_EQ(batch_size, batch_size_)
       << "Batch size [" << batch_size
       << "] does not match the expected batch size [" << batch_size_ << "].";
   for (int b = 0; b < batch_size; ++b) {
     auto& constraint_state = constraint_states_[b];
-    ASSIGN_OR_RETURN(auto bitmap,
-                     constraint_->ComputeBitmap(*constraint_state));
-    for (int i = 0; i < vocab_size; ++i) {
-      if (!bitmap->Get(i)) {
-        logits.data()[b * vocab_size + i] = tflite::half::min();
-      }
+    ABSL_ASSIGN_OR_RETURN(auto mask,
+                          constraint_->ComputeMask(*constraint_state));
+    if (mask != nullptr) {
+      ABSL_RETURN_IF_ERROR(
+          mask->Apply(logits.subspan(b * vocab_size, vocab_size)));
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ConstrainedDecoder::UpdateState(
+    const ::litert::TensorBuffer& next_token_ids) {
+  LITERT_ASSIGN_OR_RETURN(auto next_token_ids_span,
+                          ReferTensorBufferAsSpan<int>(next_token_ids));
+  return UpdateState(next_token_ids_span);
+}
+
+absl::Status ConstrainedDecoder::UpdateState(absl::Span<int> next_token_ids) {
+  RET_CHECK_EQ(next_token_ids.size(), batch_size_)
+      << "Batch size [" << next_token_ids.size()
+      << "] does not match the expected batch size [" << batch_size_ << "].";
+  for (int i = 0; i < batch_size_; ++i) {
+    auto& constraint_state = constraint_states_[i];
+    ABSL_ASSIGN_OR_RETURN(
+        constraint_state,
+        constraint_->ComputeNext(*constraint_state, next_token_ids[i]));
+    if (constraint_->IsEnded(*constraint_state)) {
+      constraint_state = constraint_->Start();
     }
   }
   return absl::OkStatus();

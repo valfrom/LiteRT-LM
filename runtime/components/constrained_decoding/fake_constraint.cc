@@ -20,24 +20,9 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/logit_mask.h"
 
 namespace litert::lm {
-
-namespace {
-
-// A bitmap implementation that allows only the one specified token.
-class SingleAllowedTokenBitmap : public Bitmap {
- public:
-  explicit SingleAllowedTokenBitmap(int allowed_token_id)
-      : allowed_token_id_(allowed_token_id) {}
-
-  bool Get(int index) const override { return index == allowed_token_id_; }
-
- private:
-  const int allowed_token_id_;
-};
-
-}  // namespace
 
 std::unique_ptr<Constraint::State> FakeConstraint::Start() const {
   return std::make_unique<FakeState>(0);
@@ -56,6 +41,16 @@ absl::StatusOr<std::unique_ptr<Constraint::State>> FakeConstraint::ComputeNext(
   }
 
   return std::make_unique<FakeState>(fake_state.index() + 1);
+}
+
+absl::StatusOr<std::unique_ptr<LogitMask>> FakeConstraint::ComputeMask(
+    const State& state) const {
+  const auto& fake_state = static_cast<const FakeState&>(state);
+  if (fake_state.index() >= token_ids_.size()) {
+    return BitmapLogitMask::CreateAllDisallowed(vocabulary_size_);
+  }
+  return BitmapLogitMask::CreateSingleAllowedToken(
+      vocabulary_size_, token_ids_[fake_state.index()]);
 }
 
 absl::StatusOr<std::unique_ptr<Bitmap>> FakeConstraint::ComputeBitmap(

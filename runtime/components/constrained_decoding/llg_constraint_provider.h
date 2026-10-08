@@ -25,10 +25,12 @@
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/constraint_provider_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"
 #include "llguidance.h"
 
 namespace litert::lm {
+
+using ::litert::support::Tokenizer;
 
 class LlgConstraintProvider : public ConstraintProvider {
  public:

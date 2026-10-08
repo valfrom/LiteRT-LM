@@ -14,17 +14,23 @@
 
 #include "runtime/engine/litert_lm_lib.h"
 
+#include <algorithm>
 #include <filesystem>  // NOLINT
 #include <fstream>
+#include <iostream>
 #include <optional>
+#include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/strings/escaping.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -38,6 +44,30 @@ namespace {
 
 using ::nlohmann::json;
 using ::testing::status::StatusIs;
+class CooptStdout {
+ public:
+  CooptStdout() : old_buf_(std::cout.rdbuf(buffer_.rdbuf())) {}
+  ~CooptStdout() { std::cout.rdbuf(old_buf_); }
+  std::string GetOutput() const { return buffer_.str(); }
+
+ private:
+  std::stringstream buffer_;
+  std::streambuf* old_buf_;
+};
+
+std::string ColorBlue(const std::string& s) {
+  if (UseColor()) {
+    return std::string("\033[34m") + s + "\033[0m";
+  }
+  return s;
+}
+
+std::string ColorYellow(const std::string& s) {
+  if (UseColor()) {
+    return std::string("\033[33m") + s + "\033[0m";
+  }
+  return s;
+}
 
 TEST(BuildContentListTest, TextOnly) {
   LiteRtLmSettings settings;
@@ -177,6 +207,131 @@ TEST(LiteRtLmLibTest, RunLiteRtLmWithEmptyModelPathReturnsError) {
               StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
+// Returns a LitertLmMetrics with one prefill and one decode turn, an "Init
+// Executor" phase of `init_phase` and the given peak memory usage.
+LitertLmMetrics CreateMetrics(absl::Duration init_phase, float peak_mem_mb,
+                              float peak_private_mb) {
+  BenchmarkInfo benchmark_info((proto::BenchmarkParams()));
+  ABSL_CHECK_OK(benchmark_info.InitPhaseRecord(
+      BenchmarkInfo::InitPhase::kExecutor, init_phase));
+  ABSL_CHECK_OK(benchmark_info.TimePrefillTurnStart());
+  ABSL_CHECK_OK(benchmark_info.TimePrefillTurnEnd(/*num_prefill_tokens=*/128));
+  ABSL_CHECK_OK(benchmark_info.TimeDecodeTurnStart());
+  ABSL_CHECK_OK(benchmark_info.TimeDecodeTurnEnd(/*num_decode_tokens=*/32));
+
+  LitertLmMetrics metrics;
+  metrics.benchmark_info = benchmark_info;
+  metrics.peak_mem_mb = peak_mem_mb;
+  metrics.peak_private_mb = peak_private_mb;
+  return metrics;
+}
+
+// Returns the median of the given values, computed independently from the
+// implementation under test.
+double MedianOf(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  return values.size() % 2 == 1
+             ? values[values.size() / 2]
+             : (values[values.size() / 2 - 1] + values[values.size() / 2]) / 2;
+}
+
+TEST(ComputeMedianMetricsTest, NoMetrics) {
+  const AggregatedLitertLmMetrics aggregated = ComputeMedianMetrics({});
+
+  EXPECT_EQ(aggregated.num_iterations, 0);
+  EXPECT_THAT(aggregated.init_phases, testing::IsEmpty());
+  EXPECT_THAT(aggregated.prefill_tokens_per_sec, testing::IsEmpty());
+  EXPECT_THAT(aggregated.decode_tokens_per_sec, testing::IsEmpty());
+  EXPECT_FALSE(aggregated.time_to_first_token_sec.has_value());
+  EXPECT_FALSE(aggregated.peak_mem_mb.has_value());
+  EXPECT_FALSE(aggregated.peak_private_mb.has_value());
+}
+
+TEST(ComputeMedianMetricsTest, OddNumberOfIterations) {
+  const std::vector<LitertLmMetrics> metrics = {
+      CreateMetrics(absl::Milliseconds(300), /*peak_mem_mb=*/300.0f,
+                    /*peak_private_mb=*/30.0f),
+      CreateMetrics(absl::Milliseconds(100), /*peak_mem_mb=*/100.0f,
+                    /*peak_private_mb=*/10.0f),
+      CreateMetrics(absl::Milliseconds(200), /*peak_mem_mb=*/200.0f,
+                    /*peak_private_mb=*/20.0f),
+  };
+
+  const AggregatedLitertLmMetrics aggregated = ComputeMedianMetrics(metrics);
+
+  EXPECT_EQ(aggregated.num_iterations, 3);
+  EXPECT_THAT(
+      aggregated.init_phases,
+      testing::ElementsAre(testing::Pair(
+          BenchmarkInfo::InitPhaseToString(BenchmarkInfo::InitPhase::kExecutor),
+          absl::Milliseconds(200))));
+  EXPECT_EQ(aggregated.peak_mem_mb, 200.0f);
+  EXPECT_EQ(aggregated.peak_private_mb, 20.0f);
+
+  std::vector<double> prefill_speeds;
+  std::vector<double> decode_speeds;
+  std::vector<double> times_to_first_token;
+  for (const LitertLmMetrics& metric : metrics) {
+    prefill_speeds.push_back(metric.benchmark_info->GetPrefillTokensPerSec(0));
+    decode_speeds.push_back(metric.benchmark_info->GetDecodeTokensPerSec(0));
+    times_to_first_token.push_back(
+        metric.benchmark_info->GetTimeToFirstToken());
+  }
+  EXPECT_THAT(aggregated.prefill_tokens_per_sec,
+              testing::ElementsAre(MedianOf(prefill_speeds)));
+  EXPECT_THAT(aggregated.decode_tokens_per_sec,
+              testing::ElementsAre(MedianOf(decode_speeds)));
+  ASSERT_TRUE(aggregated.time_to_first_token_sec.has_value());
+  EXPECT_EQ(*aggregated.time_to_first_token_sec,
+            MedianOf(times_to_first_token));
+}
+
+TEST(ComputeMedianMetricsTest, EvenNumberOfIterationsAveragesMiddleValues) {
+  const std::vector<LitertLmMetrics> metrics = {
+      CreateMetrics(absl::Milliseconds(100), /*peak_mem_mb=*/100.0f,
+                    /*peak_private_mb=*/10.0f),
+      CreateMetrics(absl::Milliseconds(400), /*peak_mem_mb=*/400.0f,
+                    /*peak_private_mb=*/40.0f),
+      CreateMetrics(absl::Milliseconds(200), /*peak_mem_mb=*/200.0f,
+                    /*peak_private_mb=*/20.0f),
+      CreateMetrics(absl::Milliseconds(300), /*peak_mem_mb=*/300.0f,
+                    /*peak_private_mb=*/30.0f),
+  };
+
+  const AggregatedLitertLmMetrics aggregated = ComputeMedianMetrics(metrics);
+
+  EXPECT_EQ(aggregated.num_iterations, 4);
+  EXPECT_THAT(
+      aggregated.init_phases,
+      testing::ElementsAre(testing::Pair(
+          BenchmarkInfo::InitPhaseToString(BenchmarkInfo::InitPhase::kExecutor),
+          absl::Milliseconds(250))));
+  EXPECT_EQ(aggregated.peak_mem_mb, 250.0f);
+  EXPECT_EQ(aggregated.peak_private_mb, 25.0f);
+}
+
+TEST(ComputeMedianMetricsTest, MetricsWithoutBenchmarkInfoAreSkipped) {
+  std::vector<LitertLmMetrics> metrics = {
+      CreateMetrics(absl::Milliseconds(100), /*peak_mem_mb=*/0.0f,
+                    /*peak_private_mb=*/0.0f),
+      CreateMetrics(absl::Milliseconds(200), /*peak_mem_mb=*/0.0f,
+                    /*peak_private_mb=*/0.0f),
+  };
+  metrics.push_back(LitertLmMetrics());
+
+  const AggregatedLitertLmMetrics aggregated = ComputeMedianMetrics(metrics);
+
+  EXPECT_EQ(aggregated.num_iterations, 3);
+  EXPECT_THAT(
+      aggregated.init_phases,
+      testing::ElementsAre(testing::Pair(
+          BenchmarkInfo::InitPhaseToString(BenchmarkInfo::InitPhase::kExecutor),
+          absl::Milliseconds(150))));
+  // Peak memory is not reported unless --report_peak_memory_footprint is set.
+  EXPECT_FALSE(aggregated.peak_mem_mb.has_value());
+  EXPECT_FALSE(aggregated.peak_private_mb.has_value());
+}
+
 // Following tests are for various model file metadata and tokenizer types.
 // They are not exhaustive, but designed to test a variety of scenarios.
 // If metadata or tokenizer types are not handled properly, these tests could
@@ -271,6 +426,19 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_MaxNumTokens) {
             1024);
 }
 
+TEST(LiteRtLmLibTest, CreateEngineSettings_VisualTokenBudget) {
+  const auto model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+  LiteRtLmSettings settings;
+  settings.model_path = model_path.string();
+  settings.visual_token_budget = 200;
+
+  auto engine_settings = CreateEngineSettings(settings);
+  ASSERT_OK(engine_settings.status());
+  EXPECT_EQ(engine_settings->GetMaxVisionTokensPerImage(), 200);
+}
+
 TEST(LiteRtLmLibTest, CreateEngineSettings_CacheConfig) {
   const auto model_path =
       std::filesystem::path(::testing::SrcDir()) /
@@ -291,6 +459,72 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_CacheConfig) {
             ":nocache");
 }
 
+TEST(LiteRtLmLibTest, CreateEngineSettings_DisableProgramCache) {
+  const auto model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+  LiteRtLmSettings settings;
+  settings.model_path = model_path.string();
+  settings.backend = "gpu";
+  settings.vision_backend = "cpu";
+  settings.audio_backend = "gpu";
+  settings.disable_gpu_program_cache = true;
+
+  auto engine_settings_or = CreateEngineSettings(settings);
+  ASSERT_OK(engine_settings_or.status());
+  const auto& engine_settings = *engine_settings_or;
+
+  EXPECT_TRUE(
+      engine_settings.GetMainExecutorSettings().IsProgramCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetMainExecutorSettings().IsWeightCacheDisabled());
+
+  ASSERT_TRUE(engine_settings.GetVisionExecutorSettings().has_value());
+  EXPECT_TRUE(
+      engine_settings.GetVisionExecutorSettings()->IsProgramCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetVisionExecutorSettings()->IsWeightCacheDisabled());
+
+  ASSERT_TRUE(engine_settings.GetAudioExecutorSettings().has_value());
+  EXPECT_TRUE(
+      engine_settings.GetAudioExecutorSettings()->IsProgramCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetAudioExecutorSettings()->IsWeightCacheDisabled());
+}
+
+TEST(LiteRtLmLibTest, CreateEngineSettings_DisableWeightCache) {
+  const auto model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+  LiteRtLmSettings settings;
+  settings.model_path = model_path.string();
+  settings.backend = "gpu";
+  settings.vision_backend = "cpu";
+  settings.audio_backend = "gpu";
+  settings.disable_weight_cache = true;
+
+  auto engine_settings_or = CreateEngineSettings(settings);
+  ASSERT_OK(engine_settings_or.status());
+  const auto& engine_settings = *engine_settings_or;
+
+  EXPECT_TRUE(
+      engine_settings.GetMainExecutorSettings().IsWeightCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetMainExecutorSettings().IsProgramCacheDisabled());
+
+  ASSERT_TRUE(engine_settings.GetVisionExecutorSettings().has_value());
+  EXPECT_TRUE(
+      engine_settings.GetVisionExecutorSettings()->IsWeightCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetVisionExecutorSettings()->IsProgramCacheDisabled());
+
+  ASSERT_TRUE(engine_settings.GetAudioExecutorSettings().has_value());
+  EXPECT_TRUE(
+      engine_settings.GetAudioExecutorSettings()->IsWeightCacheDisabled());
+  EXPECT_FALSE(
+      engine_settings.GetAudioExecutorSettings()->IsProgramCacheDisabled());
+}
+
 TEST(LiteRtLmLibTest, CreateEngineSettings_CpuConfig) {
   const auto model_path =
       std::filesystem::path(::testing::SrcDir()) /
@@ -299,6 +533,7 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_CpuConfig) {
   settings.model_path = model_path.string();
   settings.backend = "cpu";
   settings.num_cpu_threads = 8;
+  settings.enable_ynnpack = true;
   settings.prefill_chunk_size = 512;
 
   auto engine_settings_or = CreateEngineSettings(settings);
@@ -307,6 +542,7 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_CpuConfig) {
                            .GetBackendConfig<CpuConfig>();
   ASSERT_OK(cpu_config_or.status());
   EXPECT_EQ(cpu_config_or->number_of_threads, 8);
+  EXPECT_TRUE(cpu_config_or->enable_ynnpack);
   EXPECT_EQ(cpu_config_or->prefill_chunk_size, 512);
 }
 
@@ -336,6 +572,7 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_AdvancedSettings) {
   settings.num_output_candidates = 4;
   settings.conv_type = ConvType::kInt8;
   settings.prefill_batch_sizes = {1, 4, 16};
+  settings.enable_profiling = true;
 
   auto engine_settings_or = CreateEngineSettings(settings);
   ASSERT_OK(engine_settings_or.status());
@@ -345,6 +582,7 @@ TEST(LiteRtLmLibTest, CreateEngineSettings_AdvancedSettings) {
   EXPECT_EQ(advanced->num_output_candidates, 4);
   EXPECT_THAT(advanced->prefill_batch_sizes, ::testing::ElementsAre(1, 4, 16));
   EXPECT_TRUE(advanced->allow_src_quantized_fc_conv_ops.value_or(false));
+  EXPECT_TRUE(advanced->enable_profiling);
 }
 
 TEST(LiteRtLmLibTest, CreateEngineSettings_BenchmarkParams) {
@@ -400,6 +638,130 @@ TEST(LiteRtLmLibTest, RunLiteRtLmWithDeepseekMetadataTokenizer) {
   // test litertlm file, we only run 32 tokens.
   settings.max_num_tokens = 32;
   EXPECT_OK(RunLiteRtLm(settings));
+}
+TEST(PrintMessageTest, ContentArray) {
+  json message = {
+      {"role", "assistant"},
+      {"content", json::array({{{"type", "text"}, {"text", "Hello "}},
+                               {{"type", "text"}, {"text", "world!"}}})}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(PrintMessage(message, captured_output));
+  EXPECT_EQ(captured_output.str(), "Hello world!\n");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorYellow("Hello ") + ColorYellow("world!") + "\n");
+}
+
+TEST(PrintMessageTest, ContentObject) {
+  json message = {{"role", "assistant"},
+                  {"content", {{"type", "text"}, {"text", "Hello object!"}}}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(PrintMessage(message, captured_output));
+  EXPECT_EQ(captured_output.str(), "Hello object!\n");
+  EXPECT_EQ(coopt.GetOutput(), ColorYellow("Hello object!") + "\n");
+}
+
+TEST(PrintMessageTest, ContentString) {
+  json message = {{"role", "assistant"}, {"content", "Hello string!"}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(PrintMessage(message, captured_output));
+  EXPECT_EQ(captured_output.str(), "Hello string!\n");
+  EXPECT_EQ(coopt.GetOutput(), ColorYellow("Hello string!") + "\n");
+}
+
+TEST(PrintMessageTest, ChannelsStreaming) {
+  json message = {{"role", "assistant"},
+                  {"channels", {{"thought", "Thinking... "}}}};
+  std::stringstream captured_output;
+  std::string active_channel;
+  CooptStdout coopt;
+  EXPECT_OK(PrintMessage(message, captured_output, &active_channel,
+                         /*streaming=*/true));
+  EXPECT_EQ(captured_output.str(), "Thinking... ");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorBlue("[thought] ") + ColorBlue("Thinking... "));
+  EXPECT_EQ(active_channel, "thought");
+
+  // Next chunk in same channel
+  json message2 = {{"role", "assistant"},
+                   {"channels", {{"thought", "more thinking."}}}};
+  EXPECT_OK(PrintMessage(message2, captured_output, &active_channel,
+                         /*streaming=*/true));
+  EXPECT_EQ(captured_output.str(), "Thinking... more thinking.");
+  EXPECT_EQ(coopt.GetOutput(), ColorBlue("[thought] ") +
+                                   ColorBlue("Thinking... ") +
+                                   ColorBlue("more thinking."));
+  EXPECT_EQ(active_channel, "thought");
+
+  // Switch channel
+  json message3 = {{"role", "assistant"},
+                   {"channels", {{"answer", "Final answer."}}}};
+  EXPECT_OK(PrintMessage(message3, captured_output, &active_channel,
+                         /*streaming=*/true));
+  EXPECT_EQ(captured_output.str(), "Thinking... more thinking.Final answer.");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorBlue("[thought] ") + ColorBlue("Thinking... ") +
+                ColorBlue("more thinking.") + ColorBlue("[/thought]") + "\n" +
+                ColorBlue("[answer] ") + ColorBlue("Final answer."));
+  EXPECT_EQ(active_channel, "answer");
+}
+
+TEST(PrintMessageTest, ChannelsNonStreaming) {
+  json message = {{"role", "assistant"},
+                  {"channels", {{"thought", "Thinking process."}}}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(
+      PrintMessage(message, captured_output, nullptr, /*streaming=*/false));
+  EXPECT_EQ(captured_output.str(), "Thinking process.\n");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorBlue("[thought] Thinking process.[/thought]") + "\n");
+}
+
+TEST(PrintMessageTest, BothContentAndChannels) {
+  json message = {{"role", "assistant"},
+                  {"content", "Final answer."},
+                  {"channels", {{"thought", "Thinking process."}}}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(
+      PrintMessage(message, captured_output, nullptr, /*streaming=*/false));
+  EXPECT_EQ(captured_output.str(), "Thinking process.Final answer.\n");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorBlue("[thought] Thinking process.[/thought]") + "\n" +
+                ColorYellow("Final answer.") + "\n");
+}
+
+TEST(PrintMessageTest, ToolCall) {
+  json message = {{"role", "assistant"}, {"tool_calls", json::array()}};
+  std::stringstream captured_output;
+  CooptStdout coopt;
+  EXPECT_OK(PrintMessage(message, captured_output));
+  EXPECT_EQ(captured_output.str(), "");
+  EXPECT_EQ(coopt.GetOutput(), "");
+}
+
+TEST(PrintMessageTest, InvalidMessage) {
+  json message = {{"role", "assistant"}};
+  std::stringstream captured_output;
+  EXPECT_THAT(PrintMessage(message, captured_output),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(PrintMessageTest, StreamingTransitionChannelToContent) {
+  std::stringstream captured_output;
+  std::string active_channel = "thought";
+  CooptStdout coopt;
+
+  json message = {{"role", "assistant"}, {"content", "Final answer."}};
+  EXPECT_OK(PrintMessage(message, captured_output, &active_channel,
+                         /*streaming=*/true));
+  EXPECT_EQ(captured_output.str(), "Final answer.");
+  EXPECT_EQ(coopt.GetOutput(),
+            ColorBlue("[/thought]") + "\n" + ColorYellow("Final answer."));
+  EXPECT_EQ(active_channel, "");
 }
 
 }  // namespace

@@ -16,4 +16,7 @@
 
 # The next version of LiteRT-LM (e.g. the version that is currently in development).
 # The minor version code usually should be bumped after every release.
-VERSION = "0.12.0"
+VERSION = "0.18.0"
+
+# C API Compatibility version.
+C_API_VERSION = "0.2.0"

@@ -1,2 +1,5 @@
 /MODULE.bazel.lock
 /bazel-*
+/js/packages/core/wasm/
+node_modules/
+swift/device_tests/Gemma4/LiteRTValidation.xcodeproj/
